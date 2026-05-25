@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import mimetypes
-import sys
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,15 +19,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8010"
 DEFAULT_TIMEOUT_SEC = 120.0
 REQUEST_FILES_FIELD = "files"
-
-
-def app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-CONFIG_PATH = app_dir() / "gui_config.json"
+CONFIG_PATH = Path(__file__).with_name("gui_config.json")
 
 
 MODES: dict[str, dict[str, str]] = {
@@ -116,35 +107,51 @@ class DesktopClientApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Клиент распознавания пломб и контейнеров")
-        self.root.geometry("1220x840")
-        self.root.minsize(1080, 760)
-        self.root.configure(bg="#08111f")
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        window_w = min(1160, max(920, screen_w - 80))
+        window_h = min(780, max(640, screen_h - 120))
+        self.root.geometry(f"{window_w}x{window_h}")
+        self.root.minsize(820, 620)
+        self.root.configure(bg="#eef3f8")
 
         self.config_data = load_app_config()
         self.current_image_path: Path | None = None
         self.current_session: RecognitionSession | None = None
         self.preview_photo = None
         self.is_busy = False
+        self.compact_layout = False
+        self._resize_after_id: str | None = None
         self.detail_view_var = tk.BooleanVar(value=False)
         self.worker_queue: Queue[tuple[str, Any]] = Queue()
         self.colors = {
-            "button_seal": "#4e6484",
-            "button_seal_active": "#445875",
-            "button_container": "#486b69",
-            "button_container_active": "#3f5f5d",
-            "button_primary": "#5a7098",
-            "button_primary_active": "#506487",
-            "button_secondary": "#414f66",
-            "button_secondary_active": "#4b5b74",
-            "button_feedback": "#7b5f69",
-            "button_feedback_active": "#6d545d",
-            "badge_idle": "#415066",
-            "badge_progress": "#536989",
-            "badge_success": "#416b65",
-            "badge_warning": "#8a6f43",
-            "badge_error": "#79515a",
-            "toggle_on": "#607da8",
-            "toggle_off": "#3b4657",
+            "bg_app": "#eef3f8",
+            "bg_panel": "#ffffff",
+            "bg_panel_alt": "#f6f9fc",
+            "bg_surface": "#edf3f8",
+            "bg_surface_disabled": "#e5ebf2",
+            "border": "#d7e2ee",
+            "text_primary": "#18212f",
+            "text_muted": "#4f6477",
+            "text_soft": "#71859a",
+            "button_seal": "#7a9bc2",
+            "button_seal_active": "#6f8fb5",
+            "button_container": "#7fb0aa",
+            "button_container_active": "#6fa09a",
+            "button_primary": "#5d85c7",
+            "button_primary_active": "#4e76b8",
+            "button_secondary": "#90a2b7",
+            "button_secondary_active": "#8093a9",
+            "button_feedback": "#c98a97",
+            "button_feedback_active": "#bb7c89",
+            "badge_idle": "#dfe9f4",
+            "badge_progress": "#d9e7fb",
+            "badge_success": "#dff3e7",
+            "badge_warning": "#f8ecd2",
+            "badge_error": "#f7dce1",
+            "badge_text": "#24405f",
+            "toggle_on": "#79a3da",
+            "toggle_off": "#b8c5d3",
         }
 
         self.mode_var = tk.StringVar(value="seal")
@@ -154,6 +161,8 @@ class DesktopClientApp:
 
         self._build_styles()
         self._build_ui()
+        self.root.bind("<Configure>", self._on_root_configure)
+        self.root.after_idle(self._refresh_responsive_layout)
         self._poll_worker_queue()
 
     def _build_styles(self) -> None:
@@ -162,21 +171,21 @@ class DesktopClientApp:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("App.TFrame", background="#08111f")
-        style.configure("Card.TFrame", background="#111827")
-        style.configure("App.TRadiobutton", background="#111827", foreground="#e2e8f0", font=("Segoe UI", 10))
+        style.configure("App.TFrame", background=self.colors["bg_app"])
+        style.configure("Card.TFrame", background=self.colors["bg_panel"])
+        style.configure("App.TRadiobutton", background=self.colors["bg_panel"], foreground=self.colors["text_primary"], font=("Segoe UI", 10))
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, style="App.TFrame", padding=16)
-        outer.pack(fill=tk.BOTH, expand=True)
+        self.outer = ttk.Frame(self.root, style="App.TFrame", padding=12)
+        self.outer.pack(fill=tk.BOTH, expand=True)
 
-        self.page_host = tk.Frame(outer, bg="#08111f")
+        self.page_host = tk.Frame(self.outer, bg=self.colors["bg_app"])
         self.page_host.pack(fill=tk.BOTH, expand=True)
         self.page_host.grid_rowconfigure(0, weight=1)
         self.page_host.grid_columnconfigure(0, weight=1)
 
-        self.main_tab = tk.Frame(self.page_host, bg="#08111f")
-        self.settings_tab = tk.Frame(self.page_host, bg="#08111f")
+        self.main_tab = tk.Frame(self.page_host, bg=self.colors["bg_app"])
+        self.settings_tab = tk.Frame(self.page_host, bg=self.colors["bg_app"])
         for frame in (self.main_tab, self.settings_tab):
             frame.grid(row=0, column=0, sticky="nsew")
 
@@ -885,6 +894,575 @@ class DesktopClientApp:
             self.detail_text.pack_forget()
             self.detail_scroll.pack_forget()
 
+    def _build_styles(self) -> None:
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("App.TFrame", background=self.colors["bg_app"])
+        style.configure("Card.TFrame", background=self.colors["bg_panel"])
+        style.configure(
+            "App.TRadiobutton",
+            background=self.colors["bg_panel"],
+            foreground=self.colors["text_primary"],
+            font=("Segoe UI", 10),
+        )
+
+    def _build_ui(self) -> None:
+        self.outer = ttk.Frame(self.root, style="App.TFrame", padding=12)
+        self.outer.pack(fill=tk.BOTH, expand=True)
+
+        self.page_host = tk.Frame(self.outer, bg=self.colors["bg_app"])
+        self.page_host.pack(fill=tk.BOTH, expand=True)
+        self.page_host.grid_rowconfigure(0, weight=1)
+        self.page_host.grid_columnconfigure(0, weight=1)
+
+        self.main_tab = tk.Frame(self.page_host, bg=self.colors["bg_app"])
+        self.settings_tab = tk.Frame(self.page_host, bg=self.colors["bg_app"])
+        for frame in (self.main_tab, self.settings_tab):
+            frame.grid(row=0, column=0, sticky="nsew")
+
+        self._build_main_tab()
+        self._build_settings_tab()
+        self._build_menu()
+        self._update_mode_badges()
+        self._show_page("main")
+
+    def _build_main_tab(self) -> None:
+        self.main_tab.grid_columnconfigure(0, weight=3)
+        self.main_tab.grid_columnconfigure(1, weight=2)
+        self.main_tab.grid_rowconfigure(0, weight=1)
+        self.main_tab.grid_rowconfigure(1, weight=0)
+
+        self.left_panel = tk.Frame(
+            self.main_tab,
+            bg=self.colors["bg_panel"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=14,
+            pady=14,
+        )
+        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
+
+        left_top = tk.Frame(self.left_panel, bg=self.colors["bg_panel"])
+        left_top.pack(fill=tk.X)
+        left_top.grid_columnconfigure(0, weight=1)
+        self.left_title_label = tk.Label(
+            left_top,
+            text="Изображение",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_primary"],
+            font=("Segoe UI", 12, "bold"),
+        )
+        self.left_title_label.grid(row=0, column=0, sticky="w")
+
+        self.mode_shell = tk.Frame(left_top, bg=self.colors["bg_panel"])
+        self.mode_shell.grid(row=0, column=1, sticky="e")
+
+        self.mode_seal_button = tk.Button(
+            self.mode_shell,
+            text="Пломба",
+            command=lambda: self._recognize_with_mode("seal"),
+            bg=self.colors["button_seal"],
+            fg="#f8fafc",
+            activebackground=self.colors["button_seal_active"],
+            activeforeground="#f8fafc",
+            relief=tk.FLAT,
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=8,
+            bd=0,
+            highlightthickness=0,
+        )
+        self.mode_seal_button.pack(side=tk.LEFT)
+        self.mode_container_button = tk.Button(
+            self.mode_shell,
+            text="Контейнер",
+            command=lambda: self._recognize_with_mode("container"),
+            bg=self.colors["button_container"],
+            fg="#f8fafc",
+            activebackground=self.colors["button_container_active"],
+            activeforeground="#f8fafc",
+            relief=tk.FLAT,
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=8,
+            bd=0,
+            highlightthickness=0,
+        )
+        self.mode_container_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.file_info_label = tk.Label(
+            self.left_panel,
+            text="Файл не выбран",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_soft"],
+            font=("Segoe UI", 9),
+        )
+        self.file_info_label.pack(anchor="w", pady=(6, 10))
+
+        self.drop_frame = tk.Frame(
+            self.left_panel,
+            bg=self.colors["bg_surface"],
+            cursor="hand2",
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+        )
+        self.drop_frame.pack(fill=tk.BOTH, expand=True)
+        self.drop_frame.pack_propagate(False)
+
+        self.preview_label = tk.Label(
+            self.drop_frame,
+            text="Нажмите, чтобы выбрать изображение",
+            bg=self.colors["bg_surface"],
+            fg=self.colors["text_muted"],
+            font=("Segoe UI", 14, "bold"),
+            justify=tk.CENTER,
+            wraplength=420,
+        )
+        self.preview_label.pack(expand=True)
+
+        self.preview_hint_label = tk.Label(
+            self.left_panel,
+            text="Поддерживаются JPG, PNG, BMP, WEBP",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_soft"],
+            font=("Segoe UI", 9),
+        )
+        self.preview_hint_label.pack(anchor="w", pady=(8, 0))
+
+        for widget in (self.drop_frame, self.preview_label, self.preview_hint_label):
+            widget.bind("<Button-1>", lambda _event: self.select_image())
+
+        self.right_panel = tk.Frame(
+            self.main_tab,
+            bg=self.colors["bg_panel"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=14,
+            pady=14,
+        )
+        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=0)
+
+        self.right_title_label = tk.Label(
+            self.right_panel,
+            text="Распознавание",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_primary"],
+            font=("Segoe UI", 12, "bold"),
+        )
+        self.right_title_label.pack(anchor="w")
+        self.main_intro_label = tk.Label(
+            self.right_panel,
+            text="Сначала выберите изображение. Затем нажмите «Пломба» или «Контейнер» над фото, чтобы отправить запрос.",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_muted"],
+            font=("Segoe UI", 9),
+            justify=tk.LEFT,
+            wraplength=320,
+        )
+        self.main_intro_label.pack(anchor="w", pady=(6, 14))
+
+        self.status_badge = tk.Label(
+            self.right_panel,
+            text="Ожидание запроса",
+            bg=self.colors["badge_idle"],
+            fg=self.colors["badge_text"],
+            font=("Segoe UI", 10, "bold"),
+            padx=10,
+            pady=6,
+        )
+        self.status_badge.pack(anchor="w", pady=(12, 10))
+
+        self.result_value_label = tk.Label(
+            self.right_panel,
+            text="Результат пока отсутствует",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_primary"],
+            font=("Segoe UI", 20, "bold"),
+            justify=tk.LEFT,
+            wraplength=340,
+        )
+        self.result_value_label.pack(anchor="w")
+
+        self.result_meta_label = tk.Label(
+            self.right_panel,
+            text="Выберите изображение кликом по рамке. Запрос отправится по нажатию на кнопку режима над фото.",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_muted"],
+            font=("Segoe UI", 9),
+            justify=tk.LEFT,
+            wraplength=340,
+        )
+        self.result_meta_label.pack(anchor="w", pady=(8, 16))
+
+        self.toggle_row = tk.Frame(self.right_panel, bg=self.colors["bg_panel"])
+        self.toggle_row.pack(fill=tk.X, pady=(0, 12))
+        self.toggle_label = tk.Label(
+            self.toggle_row,
+            text="Подробный результат",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_primary"],
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.toggle_label.pack(side=tk.LEFT)
+
+        self.toggle_canvas = tk.Canvas(
+            self.toggle_row,
+            width=58,
+            height=30,
+            bg=self.colors["bg_panel"],
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.toggle_canvas.pack(side=tk.RIGHT)
+        self.toggle_canvas.bind("<Button-1>", lambda _event: self._toggle_detail_view())
+        self._render_detail_toggle()
+
+        self.detail_wrap = tk.Frame(
+            self.right_panel,
+            bg=self.colors["bg_panel_alt"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+        )
+        self.detail_wrap.pack(fill=tk.BOTH, expand=True)
+        self.detail_wrap.pack_propagate(False)
+
+        self.detail_text = tk.Text(
+            self.detail_wrap,
+            wrap=tk.WORD,
+            bg=self.colors["bg_panel_alt"],
+            fg=self.colors["text_primary"],
+            insertbackground=self.colors["text_primary"],
+            relief=tk.FLAT,
+            font=("Cascadia Code", 9),
+            height=12,
+            padx=10,
+            pady=10,
+        )
+        self.detail_scroll = tk.Scrollbar(self.detail_wrap, command=self.detail_text.yview)
+        self.detail_text.configure(yscrollcommand=self.detail_scroll.set)
+        self.detail_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.detail_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._set_text(self.detail_text, "{\n  \"status\": \"idle\"\n}")
+        self._update_detail_visibility()
+
+        self.feedback_button = tk.Button(
+            self.right_panel,
+            text="Отправить обратную связь",
+            command=self.open_feedback_panel,
+            state=tk.DISABLED,
+            bg=self.colors["button_feedback"],
+            fg="#f8fafc",
+            activebackground=self.colors["button_feedback_active"],
+            activeforeground="#f8fafc",
+            relief=tk.FLAT,
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=8,
+        )
+        self.feedback_button.pack(fill=tk.X, pady=(12, 0))
+        self.feedback_button.pack_forget()
+
+        self.feedback_panel = tk.Frame(
+            self.right_panel,
+            bg=self.colors["bg_panel_alt"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=12,
+            pady=12,
+        )
+        self.feedback_panel.pack(fill=tk.X, pady=(12, 0))
+        self.feedback_panel.pack_forget()
+
+        tk.Label(
+            self.feedback_panel,
+            text="Обратная связь",
+            bg=self.colors["bg_panel_alt"],
+            fg=self.colors["text_primary"],
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+        self.feedback_service_label = tk.Label(
+            self.feedback_panel,
+            text="",
+            bg=self.colors["bg_panel_alt"],
+            fg=self.colors["text_muted"],
+            font=("Segoe UI", 9),
+            wraplength=320,
+            justify=tk.LEFT,
+        )
+        self.feedback_service_label.pack(anchor="w", pady=(6, 12))
+        tk.Label(
+            self.feedback_panel,
+            text="Какой результат должен быть:",
+            bg=self.colors["bg_panel_alt"],
+            fg=self.colors["text_primary"],
+            font=("Segoe UI", 9),
+        ).pack(anchor="w")
+        self.feedback_expected_entry = tk.Entry(self.feedback_panel, textvariable=self.feedback_expected_var)
+        self.feedback_expected_entry.pack(fill=tk.X, pady=(6, 12))
+        self.feedback_actions = tk.Frame(self.feedback_panel, bg=self.colors["bg_panel_alt"])
+        self.feedback_actions.pack(fill=tk.X)
+        self.feedback_cancel_button = tk.Button(
+            self.feedback_actions,
+            text="Отмена",
+            command=self.close_feedback_panel,
+            bg=self.colors["button_secondary"],
+            fg="#f8fafc",
+            activebackground=self.colors["button_secondary_active"],
+            activeforeground="#f8fafc",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=8,
+        )
+        self.feedback_cancel_button.pack(side=tk.RIGHT, padx=(8, 0))
+        self.feedback_send_button = tk.Button(
+            self.feedback_actions,
+            text="Отправить",
+            command=self.submit_feedback_from_panel,
+            bg=self.colors["button_primary"],
+            fg="#f8fafc",
+            activebackground=self.colors["button_primary_active"],
+            activeforeground="#f8fafc",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=8,
+        )
+        self.feedback_send_button.pack(side=tk.RIGHT)
+        self.feedback_status_label = tk.Label(
+            self.feedback_panel,
+            text="",
+            bg=self.colors["bg_panel_alt"],
+            fg=self.colors["text_muted"],
+            font=("Segoe UI", 9),
+            wraplength=320,
+            justify=tk.LEFT,
+        )
+        self.feedback_status_label.pack(anchor="w", pady=(12, 0))
+
+        self.status_line = tk.Label(
+            self.right_panel,
+            text="Готово к работе.",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_soft"],
+            font=("Segoe UI", 9),
+            justify=tk.LEFT,
+            wraplength=340,
+        )
+        self.status_line.pack(anchor="w", pady=(12, 0))
+
+    def _build_settings_tab(self) -> None:
+        self.settings_tab.grid_columnconfigure(0, weight=1)
+
+        self.settings_card = tk.Frame(
+            self.settings_tab,
+            bg=self.colors["bg_panel"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=14,
+            pady=14,
+        )
+        self.settings_card.grid(row=0, column=0, sticky="nwe")
+
+        tk.Label(
+            self.settings_card,
+            text="Настройки подключения",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_primary"],
+            font=("Segoe UI", 12, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(
+            self.settings_card,
+            text=f"Конфигурация хранится в файле: {CONFIG_PATH.name}",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_muted"],
+            font=("Segoe UI", 9),
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 16))
+
+        tk.Label(self.settings_card, text="URL сервиса", bg=self.colors["bg_panel"], fg=self.colors["text_primary"]).grid(row=2, column=0, sticky="w")
+        tk.Entry(self.settings_card, textvariable=self.api_base_var, width=44).grid(row=3, column=0, sticky="ew", pady=(6, 14))
+
+        tk.Label(self.settings_card, text="Таймаут, сек", bg=self.colors["bg_panel"], fg=self.colors["text_primary"]).grid(row=4, column=0, sticky="w")
+        tk.Entry(self.settings_card, textvariable=self.timeout_var, width=14).grid(row=5, column=0, sticky="w", pady=(6, 14))
+
+        self.settings_buttons = tk.Frame(self.settings_card, bg=self.colors["bg_panel"])
+        self.settings_buttons.grid(row=6, column=0, sticky="w")
+        self.save_settings_button = tk.Button(
+            self.settings_buttons,
+            text="Сохранить настройки",
+            command=self.save_settings,
+            bg=self.colors["button_primary"],
+            fg="#f8fafc",
+            activebackground=self.colors["button_primary_active"],
+            activeforeground="#f8fafc",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=8,
+        )
+        self.save_settings_button.pack(side=tk.LEFT)
+        self.reset_settings_button = tk.Button(
+            self.settings_buttons,
+            text="Сбросить по умолчанию",
+            command=self.reset_settings,
+            bg=self.colors["button_secondary"],
+            fg="#f8fafc",
+            activebackground=self.colors["button_secondary_active"],
+            activeforeground="#f8fafc",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=8,
+        )
+        self.reset_settings_button.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.settings_status_label = tk.Label(
+            self.settings_card,
+            text="Настройки загружены.",
+            bg=self.colors["bg_panel"],
+            fg=self.colors["text_soft"],
+            font=("Segoe UI", 9),
+        )
+        self.settings_status_label.grid(row=7, column=0, sticky="w", pady=(16, 0))
+
+        self.settings_card.grid_columnconfigure(0, weight=1)
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(80, self._refresh_responsive_layout)
+
+    def _refresh_responsive_layout(self) -> None:
+        self._resize_after_id = None
+        width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
+        compact = width < 1100
+        self.compact_layout = compact
+        self._apply_main_layout(compact)
+        self._apply_settings_layout(compact)
+        self._apply_wraplengths()
+        if self.current_image_path is not None:
+            self._render_preview()
+
+    def _apply_main_layout(self, compact: bool) -> None:
+        if compact:
+            self.main_tab.grid_columnconfigure(0, weight=1)
+            self.main_tab.grid_columnconfigure(1, weight=0)
+            self.left_panel.grid_configure(row=0, column=0, padx=0, pady=(0, 8), sticky="nsew")
+            self.right_panel.grid_configure(row=1, column=0, padx=0, pady=0, sticky="nsew")
+            self.mode_shell.grid_configure(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            self.mode_container_button.pack_configure(padx=(6, 0))
+            self.preview_label.config(font=("Segoe UI", 12, "bold"))
+            self.result_value_label.config(font=("Segoe UI", 16, "bold"))
+            self.detail_text.config(height=9)
+        else:
+            self.main_tab.grid_columnconfigure(0, weight=3)
+            self.main_tab.grid_columnconfigure(1, weight=2)
+            self.left_panel.grid_configure(row=0, column=0, padx=(0, 6), pady=0, sticky="nsew")
+            self.right_panel.grid_configure(row=0, column=1, padx=(6, 0), pady=0, sticky="nsew")
+            self.mode_shell.grid_configure(row=0, column=1, columnspan=1, sticky="e", pady=0)
+            self.mode_container_button.pack_configure(padx=(8, 0))
+            self.preview_label.config(font=("Segoe UI", 14, "bold"))
+            self.result_value_label.config(font=("Segoe UI", 20, "bold"))
+            self.detail_text.config(height=12)
+
+    def _apply_settings_layout(self, compact: bool) -> None:
+        self.save_settings_button.pack_forget()
+        self.reset_settings_button.pack_forget()
+        if compact:
+            self.save_settings_button.pack(fill=tk.X)
+            self.reset_settings_button.pack(fill=tk.X, pady=(8, 0))
+        else:
+            self.save_settings_button.pack(side=tk.LEFT)
+            self.reset_settings_button.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.feedback_send_button.pack_forget()
+        self.feedback_cancel_button.pack_forget()
+        if compact:
+            self.feedback_send_button.pack(fill=tk.X)
+            self.feedback_cancel_button.pack(fill=tk.X, pady=(8, 0))
+        else:
+            self.feedback_cancel_button.pack(side=tk.RIGHT, padx=(8, 0))
+            self.feedback_send_button.pack(side=tk.RIGHT)
+
+    def _apply_wraplengths(self) -> None:
+        right_width = self.right_panel.winfo_width() or 360
+        left_width = self.left_panel.winfo_width() or 480
+        info_wrap = max(240, right_width - 36)
+        preview_wrap = max(260, left_width - 48)
+        feedback_wrap = max(220, right_width - 50)
+
+        self.preview_label.config(wraplength=preview_wrap)
+        self.main_intro_label.config(wraplength=info_wrap)
+        self.result_value_label.config(wraplength=info_wrap)
+        self.result_meta_label.config(wraplength=info_wrap)
+        self.status_line.config(wraplength=info_wrap)
+        self.feedback_service_label.config(wraplength=feedback_wrap)
+        self.feedback_status_label.config(wraplength=feedback_wrap)
+
+    def _preview_target_size(self) -> tuple[int, int]:
+        frame_w = max(self.drop_frame.winfo_width(), 320)
+        frame_h = max(self.drop_frame.winfo_height(), 240)
+        width = max(260, frame_w - 28)
+        height = max(200, frame_h - 28)
+        return width, height
+
+    def _render_preview(self) -> None:
+        if self.current_image_path is None:
+            self.preview_label.config(image="", text="Нажмите, чтобы выбрать изображение")
+            self.preview_hint_label.config(text="Поддерживаются JPG, PNG, BMP, WEBP")
+            self.preview_photo = None
+            return
+
+        if not PIL_AVAILABLE:
+            self.preview_label.config(image="", text=f"{self.current_image_path.name}\n\nДля превью установите Pillow")
+            self.preview_hint_label.config(text="")
+            self.preview_photo = None
+            return
+
+        try:
+            image = Image.open(self.current_image_path)
+            image.thumbnail(self._preview_target_size(), Image.Resampling.LANCZOS)
+            self.preview_photo = ImageTk.PhotoImage(image)
+            self.preview_label.config(image=self.preview_photo, text="")
+            self.preview_hint_label.config(text="Нажмите на рамку, чтобы выбрать другое изображение")
+        except Exception as exc:
+            self.preview_label.config(image="", text=f"Не удалось открыть изображение:\n{exc}")
+            self.preview_hint_label.config(text="")
+            self.preview_photo = None
+
+    def _set_image_picker_enabled(self, enabled: bool) -> None:
+        cursor = "hand2" if enabled else "watch"
+        bg = self.colors["bg_surface"] if enabled else self.colors["bg_surface_disabled"]
+        self.drop_frame.config(cursor=cursor, bg=bg)
+        self.preview_label.config(cursor=cursor, bg=bg)
+        self.preview_hint_label.config(cursor=cursor)
+
+    def _render_detail_toggle(self) -> None:
+        self.toggle_canvas.delete("all")
+        enabled = self.detail_view_var.get()
+        track_color = self.colors["toggle_on"] if enabled else self.colors["toggle_off"]
+        x1, y1, x2, y2 = 4, 5, 54, 27
+        radius = (y2 - y1) / 2
+        self.toggle_canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, outline="", fill=track_color)
+        self.toggle_canvas.create_oval(x1, y1, x1 + 2 * radius, y2, outline="", fill=track_color)
+        self.toggle_canvas.create_oval(x2 - 2 * radius, y1, x2, y2, outline="", fill=track_color)
+        knob_radius = 8
+        knob_center_x = x2 - radius if enabled else x1 + radius
+        knob_center_y = (y1 + y2) / 2
+        self.toggle_canvas.create_oval(
+            knob_center_x - knob_radius,
+            knob_center_y - knob_radius,
+            knob_center_x + knob_radius,
+            knob_center_y + knob_radius,
+            outline="",
+            fill="#ffffff",
+        )
 
 def main() -> None:
     root = tk.Tk()

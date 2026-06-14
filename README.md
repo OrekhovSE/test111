@@ -1,157 +1,207 @@
+from ultralytics import YOLO
 from pathlib import Path
-import random
 import shutil
-import yaml
-
-# =========================
-# НАСТРОЙКИ
-# =========================
-
-SOURCE_DIR = Path("master_dataset")
-OUTPUT_DIR = Path("yolo_dataset")
-
-# Доля val для каждой подпапки
-# Например: 0.2 = 20% val, 80% train
-VAL_RATIO_BY_GROUP = {
-    "vertical": 0.2,
-    "oneline": 0.2,
-    "twolines": 0.2,
-}
-
-# Если появится папка, которой нет выше, будет использовано это значение
-DEFAULT_VAL_RATIO = 0.2
-
-SEED = 42
-
-# Если True — копирует файлы
-# Если False — создает symlink, чтобы не дублировать датасет
-COPY_FILES = True
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-# Названия классов YOLO
-# Замени на свои классы
-CLASS_NAMES = [
-    "number"
-]
+import hashlib
+import csv
+import argparse
 
 
-# =========================
-# ЛОГИКА
-# =========================
-
-def copy_or_link(src: Path, dst: Path):
-    dst.parent.mkdir(parents=True, exist_ok=True)
-
-    if COPY_FILES:
-        shutil.copy2(src, dst)
-    else:
-        if dst.exists():
-            dst.unlink()
-        dst.symlink_to(src.resolve())
-
-
-def get_label_path(image_path: Path, images_root: Path, labels_root: Path) -> Path:
-    relative_path = image_path.relative_to(images_root)
-    return labels_root / relative_path.with_suffix(".txt")
-
-
-def split_group(group_name: str, images_root: Path, labels_root: Path):
-    group_images_dir = images_root / group_name
-
-    images = [
-        p for p in group_images_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-    ]
-
-    if not images:
-        print(f"[SKIP] {group_name}: изображений не найдено")
-        return
-
-    random.shuffle(images)
-
-    val_ratio = VAL_RATIO_BY_GROUP.get(group_name, DEFAULT_VAL_RATIO)
-    val_count = round(len(images) * val_ratio)
-
-    if len(images) > 1 and val_ratio > 0:
-        val_count = max(1, val_count)
-
-    val_images = set(images[:val_count])
-    train_images = set(images[val_count:])
-
-    print(
-        f"[OK] {group_name}: всего={len(images)}, "
-        f"train={len(train_images)}, val={len(val_images)}"
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Поиск плохих изображений по результатам YOLO"
     )
 
-    for image_path in images:
-        split_name = "val" if image_path in val_images else "train"
+    parser.add_argument("--weights", required=True, help="Путь к весам YOLO")
+    parser.add_argument("--src", required=True, help="Корневая папка с изображениями")
+    parser.add_argument("--out", required=True, help="Папка для сохранения результата")
 
-        relative_path = image_path.relative_to(images_root)
-
-        dst_image = OUTPUT_DIR / "images" / split_name / relative_path
-        dst_label = OUTPUT_DIR / "labels" / split_name / relative_path.with_suffix(".txt")
-
-        src_label = get_label_path(image_path, images_root, labels_root)
-
-        copy_or_link(image_path, dst_image)
-
-        if src_label.exists():
-            copy_or_link(src_label, dst_label)
-        else:
-            # Если у изображения нет разметки, создаем пустой label.
-            # Для YOLO это означает изображение без объектов.
-            dst_label.parent.mkdir(parents=True, exist_ok=True)
-            dst_label.write_text("", encoding="utf-8")
-            print(f"[WARN] Нет label для: {image_path}")
-
-
-def create_data_yaml():
-    data = {
-        "path": str(OUTPUT_DIR.resolve()),
-        "train": "images/train",
-        "val": "images/val",
-        "names": CLASS_NAMES,
-    }
-
-    yaml_path = OUTPUT_DIR / "data.yaml"
-    yaml_path.write_text(
-        yaml.dump(data, allow_unicode=True, sort_keys=False),
-        encoding="utf-8"
+    parser.add_argument(
+        "--min-conf",
+        type=float,
+        default=0.25,
+        help="Минимальная уверенность для учета детекции"
     )
 
-    print(f"[OK] Создан файл: {yaml_path}")
+    parser.add_argument(
+        "--low-conf",
+        type=float,
+        default=0.50,
+        help="Порог низкой уверенности"
+    )
+
+    parser.add_argument(
+        "--classes",
+        default=None,
+        help="Классы через запятую, например 0 или 0,1,2. Если не указано - берутся все"
+    )
+
+    return parser.parse_args()
+
+
+def make_unique_name(img_path: Path, root: Path) -> str:
+    rel = img_path.relative_to(root)
+    safe_name = "__".join(rel.with_suffix("").parts)
+    h = hashlib.md5(str(rel).encode("utf-8")).hexdigest()[:8]
+    return f"{safe_name}__{h}{img_path.suffix.lower()}"
 
 
 def main():
-    random.seed(SEED)
+    args = parse_args()
 
-    images_root = SOURCE_DIR / "images"
-    labels_root = SOURCE_DIR / "labels"
+    weights = Path(args.weights)
+    src_root = Path(args.src)
+    out_root = Path(args.out)
 
-    if not images_root.exists():
-        raise FileNotFoundError(f"Не найдена папка: {images_root}")
+    min_conf = args.min_conf
+    low_conf = args.low_conf
 
-    if not labels_root.exists():
-        raise FileNotFoundError(f"Не найдена папка: {labels_root}")
+    target_classes = (
+        [int(x.strip()) for x in args.classes.split(",")]
+        if args.classes
+        else None
+    )
 
-    if OUTPUT_DIR.exists():
-        shutil.rmtree(OUTPUT_DIR)
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-    groups = [
-        p.name for p in images_root.iterdir()
-        if p.is_dir()
+    bad_images_root = out_root / "bad_images"
+    bad_labels_root = out_root / "bad_labels"
+
+    reason_folders = [
+        "zero_objects",
+        "low_conf",
+        "multiple_objects"
     ]
 
-    if not groups:
-        raise RuntimeError("В папке images нет подпапок с датасетами")
+    for folder in reason_folders:
+        (bad_images_root / folder).mkdir(parents=True, exist_ok=True)
+        (bad_labels_root / folder).mkdir(parents=True, exist_ok=True)
 
-    for group_name in groups:
-        split_group(group_name, images_root, labels_root)
+    model = YOLO(str(weights))
 
-    create_data_yaml()
+    images = [
+        p for p in src_root.rglob("*")
+        if p.is_file() and p.suffix.lower() in image_exts
+    ]
 
-    print("\nГотово. Теперь можно запускать обучение YOLO.")
+    print(f"Найдено изображений: {len(images)}")
+
+    report_path = out_root / "bad_report.csv"
+
+    total_ok = 0
+    total_bad = 0
+    total_zero = 0
+    total_low_conf = 0
+    total_multiple = 0
+    total_errors = 0
+
+    with open(report_path, "w", newline="", encoding="utf-8") as report_file:
+        writer = csv.writer(report_file)
+        writer.writerow([
+            "source_image",
+            "saved_image",
+            "case_folder",
+            "reason",
+            "objects_count",
+            "classes",
+            "confidences"
+        ])
+
+        for img_path in images:
+            try:
+                results = model.predict(
+                    source=str(img_path),
+                    conf=min_conf,
+                    verbose=False
+                )
+
+                result = results[0]
+                detections = []
+
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        cls_id = int(box.cls.item())
+                        conf = float(box.conf.item())
+
+                        if target_classes is not None and cls_id not in target_classes:
+                            continue
+
+                        x_center, y_center, width, height = box.xywhn[0].tolist()
+
+                        detections.append({
+                            "cls_id": cls_id,
+                            "conf": conf,
+                            "label_line": f"{cls_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+                        })
+
+                det_count = len(detections)
+
+                is_bad = False
+                case_folder = None
+                reason = ""
+
+                if det_count == 0:
+                    is_bad = True
+                    case_folder = "zero_objects"
+                    reason = "objects_count_0"
+                    total_zero += 1
+
+                elif det_count > 1:
+                    is_bad = True
+                    case_folder = "multiple_objects"
+                    reason = f"objects_count_{det_count}"
+                    total_multiple += 1
+
+                else:
+                    only_conf = detections[0]["conf"]
+
+                    if only_conf < low_conf:
+                        is_bad = True
+                        case_folder = "low_conf"
+                        reason = f"low_conf_{only_conf:.4f}"
+                        total_low_conf += 1
+
+                if not is_bad:
+                    total_ok += 1
+                    continue
+
+                new_image_name = make_unique_name(img_path, src_root)
+                new_label_name = Path(new_image_name).with_suffix(".txt").name
+
+                dst_image = bad_images_root / case_folder / new_image_name
+                dst_label = bad_labels_root / case_folder / new_label_name
+
+                shutil.copy2(img_path, dst_image)
+
+                with open(dst_label, "w", encoding="utf-8") as f:
+                    for det in detections:
+                        f.write(det["label_line"] + "\n")
+
+                writer.writerow([
+                    str(img_path),
+                    str(dst_image),
+                    case_folder,
+                    reason,
+                    det_count,
+                    ",".join(str(det["cls_id"]) for det in detections),
+                    ",".join(f"{det['conf']:.4f}" for det in detections)
+                ])
+
+                total_bad += 1
+
+            except Exception as e:
+                print(f"Ошибка с файлом: {img_path}")
+                print(e)
+                total_errors += 1
+
+    print("Готово")
+    print(f"Хороших изображений: {total_ok}")
+    print(f"Плохих изображений всего: {total_bad}")
+    print(f"  zero_objects: {total_zero}")
+    print(f"  low_conf: {total_low_conf}")
+    print(f"  multiple_objects: {total_multiple}")
+    print(f"Ошибок обработки: {total_errors}")
+    print(f"Результат: {out_root}")
+    print(f"Отчет: {report_path}")
 
 
 if __name__ == "__main__":

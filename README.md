@@ -753,49 +753,131 @@ def candidate_for_best_range(item: ProcessedImage, good_conf: float) -> bool:
     return detection.confidence >= good_conf and is_full_readable(detection)
 
 
+def numbered_single_detection(item: ProcessedImage) -> bool:
+    return item.info.frame_number is not None and len(item.detections) == 1
+
+
+def numbered_good_detection(item: ProcessedImage, good_conf: float) -> bool:
+    return numbered_single_detection(item) and item.detections[0].confidence >= good_conf
+
+
+def build_consecutive_ranges(items: list[ProcessedImage]) -> list[list[ProcessedImage]]:
+    ordered = sorted(items, key=consecutive_key)
+    if not ordered:
+        return []
+
+    ranges: list[list[ProcessedImage]] = []
+    current_range = [ordered[0]]
+    for item in ordered[1:]:
+        previous_frame = current_range[-1].info.frame_number
+        current_frame = item.info.frame_number
+        if (
+            previous_frame is not None
+            and current_frame is not None
+            and current_frame in (previous_frame, previous_frame + 1)
+        ):
+            current_range.append(item)
+        else:
+            ranges.append(current_range)
+            current_range = [item]
+    ranges.append(current_range)
+    return ranges
+
+
+def best_range_row(
+    device_id: str,
+    camera_id: str,
+    range_type: str,
+    items: list[ProcessedImage],
+) -> dict[str, Any]:
+    conf_values = [item.detections[0].confidence for item in items]
+    frame_numbers = [
+        item.info.frame_number for item in items if item.info.frame_number is not None
+    ]
+    return {
+        "device_id": device_id,
+        "camera_id": camera_id,
+        "range_type": range_type,
+        "start_frame": min(frame_numbers),
+        "end_frame": max(frame_numbers),
+        "frames_count": len(set(frame_numbers)),
+        "average_confidence": f"{mean(conf_values):.6f}",
+        "max_confidence": f"{max(conf_values):.6f}",
+    }
+
+
+def empty_range_row(device_id: str, camera_id: str, range_type: str) -> dict[str, Any]:
+    return {
+        "device_id": device_id,
+        "camera_id": camera_id,
+        "range_type": range_type,
+        "start_frame": "",
+        "end_frame": "",
+        "frames_count": 0,
+        "average_confidence": "",
+        "max_confidence": "",
+    }
+
+
+def select_best_range(
+    ranges: list[list[ProcessedImage]],
+) -> list[ProcessedImage]:
+    return max(
+        ranges,
+        key=lambda group: (
+            len({item.info.frame_number for item in group}),
+            mean(item.detections[0].confidence for item in group),
+            max(item.detections[0].confidence for item in group),
+        ),
+    )
+
+
 def best_consecutive_ranges(processed: list[ProcessedImage], good_conf: float) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str], list[ProcessedImage]] = defaultdict(list)
+    grouped_all: dict[tuple[str, str], list[ProcessedImage]] = defaultdict(list)
     for item in processed:
-        if item.info.frame_number is not None and candidate_for_best_range(item, good_conf):
-            grouped[(item.info.device_id, item.info.camera_id)].append(item)
+        grouped_all[(item.info.device_id, item.info.camera_id)].append(item)
 
     rows: list[dict[str, Any]] = []
-    for (device_id, camera_id), items in grouped.items():
-        ordered = sorted(items, key=consecutive_key)
-        if not ordered:
+    for (device_id, camera_id), items in grouped_all.items():
+        candidate_levels = [
+            (
+                "full_readable_good",
+                [
+                    item
+                    for item in items
+                    if item.info.frame_number is not None
+                    and candidate_for_best_range(item, good_conf)
+                ],
+            ),
+            (
+                "any_class_good",
+                [item for item in items if numbered_good_detection(item, good_conf)],
+            ),
+            (
+                "any_single_object",
+                [item for item in items if numbered_single_detection(item)],
+            ),
+        ]
+
+        selected_type = ""
+        selected_ranges: list[list[ProcessedImage]] = []
+        for range_type, candidates in candidate_levels:
+            selected_ranges = build_consecutive_ranges(candidates)
+            if selected_ranges:
+                selected_type = range_type
+                break
+
+        if selected_ranges:
+            best_range = select_best_range(selected_ranges)
+            rows.append(best_range_row(device_id, camera_id, selected_type, best_range))
             continue
 
-        ranges: list[list[ProcessedImage]] = []
-        current_range = [ordered[0]]
-        for item in ordered[1:]:
-            previous = current_range[-1]
-            if item.info.frame_number == previous.info.frame_number + 1:
-                current_range.append(item)
-            else:
-                ranges.append(current_range)
-                current_range = [item]
-        ranges.append(current_range)
-
-        best_range = max(
-            ranges,
-            key=lambda group: (
-                len(group),
-                mean(item.detections[0].confidence for item in group),
-                max(item.detections[0].confidence for item in group),
-            ),
-        )
-        conf_values = [item.detections[0].confidence for item in best_range]
-        rows.append(
-            {
-                "device_id": device_id,
-                "camera_id": camera_id,
-                "start_frame": best_range[0].info.frame_number,
-                "end_frame": best_range[-1].info.frame_number,
-                "frames_count": len(best_range),
-                "average_confidence": f"{mean(conf_values):.6f}",
-                "max_confidence": f"{max(conf_values):.6f}",
-            }
-        )
+        if any(len(item.detections) == 1 for item in items):
+            rows.append(empty_range_row(device_id, camera_id, "no_frame_number"))
+        elif any(item.detections for item in items):
+            rows.append(empty_range_row(device_id, camera_id, "no_single_object"))
+        else:
+            rows.append(empty_range_row(device_id, camera_id, "no_detection"))
 
     rows.sort(key=lambda row: (row["device_id"], row["camera_id"]))
     return rows
@@ -808,6 +890,7 @@ def write_best_ranges_csv(
     fieldnames = [
         "device_id",
         "camera_id",
+        "range_type",
         "start_frame",
         "end_frame",
         "frames_count",
@@ -895,6 +978,7 @@ def render_ranges_table(best_range_rows: list[dict[str, Any]]) -> str:
             "<tr>"
             f"<td>{html.escape(str(row['device_id']))}</td>"
             f"<td>{html.escape(str(row['camera_id']))}</td>"
+            f"<td>{html.escape(str(row['range_type']))}</td>"
             f"<td>{html.escape(str(row['start_frame']))}</td>"
             f"<td>{html.escape(str(row['end_frame']))}</td>"
             f"<td>{html.escape(str(row['frames_count']))}</td>"
@@ -995,7 +1079,7 @@ def write_html_report(
     <table>
       <thead>
         <tr>
-          <th>device</th><th>camera</th><th>start_frame</th><th>end_frame</th>
+          <th>device</th><th>camera</th><th>range_type</th><th>start_frame</th><th>end_frame</th>
           <th>frames_count</th><th>average_confidence</th><th>max_confidence</th>
         </tr>
       </thead>

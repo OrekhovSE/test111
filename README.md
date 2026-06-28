@@ -105,6 +105,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Необязательный список классов через запятую: 0,1 или имена классов",
     )
+    parser.add_argument(
+        "--frame-regex",
+        default=None,
+        help=(
+            "Необязательное regex-правило для номера фрейма. "
+            "Если есть группа, берется первая группа. Пример: 'img_(\\d+)'"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -123,6 +131,11 @@ def validate_common_args(args: argparse.Namespace) -> None:
         raise ValueError("--good-conf должен быть в диапазоне от 0 до 1")
     if args.min_conf > args.good_conf:
         raise ValueError("--min-conf не должен быть больше --good-conf")
+    if args.frame_regex:
+        try:
+            re.compile(args.frame_regex)
+        except re.error as exc:
+            raise ValueError(f"Некорректный --frame-regex: {exc}") from exc
 
 
 def sorted_paths(paths: Iterable[Path]) -> list[Path]:
@@ -141,12 +154,34 @@ def is_camera_dir_name(name: str) -> bool:
     return name.lower().startswith("cam_")
 
 
-def extract_frame_number(path: Path) -> int | None:
-    match = re.search(r"frame[_-]?(\d+)", path.stem, flags=re.IGNORECASE)
-    return int(match.group(1)) if match else None
+def int_from_regex_match(match: re.Match[str]) -> int | None:
+    value = match.group(1) if match.groups() else match.group(0)
+    number_match = re.search(r"\d+", value)
+    return int(number_match.group(0)) if number_match else None
 
 
-def extract_image_info(path: Path) -> ImageInfo | None:
+def extract_frame_number(path: Path, frame_regex: str | None = None) -> int | None:
+    path_parts = [path.stem, *reversed(path.parent.parts)]
+
+    if frame_regex:
+        for part in path_parts:
+            custom_match = re.search(frame_regex, part, flags=re.IGNORECASE)
+            if custom_match:
+                return int_from_regex_match(custom_match)
+
+    for part in path_parts:
+        frame_match = re.search(r"frame[_-]?(\d+)", part, flags=re.IGNORECASE)
+        if frame_match:
+            return int(frame_match.group(1))
+
+    number_matches = re.findall(r"\d+", path.stem)
+    if number_matches:
+        return int(number_matches[-1])
+
+    return None
+
+
+def extract_image_info(path: Path, frame_regex: str | None = None) -> ImageInfo | None:
     parts = path.parts
     device_index = next(
         (idx for idx, part in enumerate(parts) if is_device_dir_name(part)), None
@@ -169,18 +204,20 @@ def extract_image_info(path: Path) -> ImageInfo | None:
         source_path=path,
         device_id=parts[device_index],
         camera_id=parts[camera_index],
-        frame_number=extract_frame_number(path),
+        frame_number=extract_frame_number(path, frame_regex),
         image_name=path.name,
     )
 
 
-def discover_images(src: Path) -> tuple[list[ImageInfo], set[str], set[tuple[str, str]]]:
+def discover_images(
+    src: Path, frame_regex: str | None = None
+) -> tuple[list[ImageInfo], set[str], set[tuple[str, str]]]:
     devices = {path.name for path in src.rglob("*") if path.is_dir() and is_device_dir_name(path.name)}
     cameras: set[tuple[str, str]] = set()
     images: list[ImageInfo] = []
 
     for image_path in sorted_paths(path for path in src.rglob("*") if is_image(path)):
-        info = extract_image_info(image_path)
+        info = extract_image_info(image_path, frame_regex)
         if info is None:
             continue
         images.append(info)
@@ -1068,7 +1105,7 @@ def main() -> int:
         reports_dir = ensure_result_directories(args.out)
 
         print("Поиск изображений...")
-        images, devices, cameras = discover_images(args.src)
+        images, devices, cameras = discover_images(args.src, args.frame_regex)
         validate_discovery(images, devices, cameras)
         print(f"Найдено device_*: {len(devices)}")
         print(f"Найдено пар device_* / cam_* с изображениями: {len(cameras)}")

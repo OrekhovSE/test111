@@ -1,1233 +1,951 @@
+python add_text_zones_to_yolo_dataset.py \
+  --images-dir master_dataset/images \
+  --labels-dir master_dataset/labels \
+  --model runs/detect/train/weights/best.pt \
+  --output-labels-dir master_dataset/labels_with_text \
+  --container-class 0 \
+  --text-class 1 \
+  --pad-x-ratio 0.10 \
+  --pad-y-ratio 0.10 \
+  --conf 0.30 \
+  --device 0 \
+  --dry-run
+
+
+
+
+python add_text_zones_to_yolo_dataset.py \
+  --images-dir master_dataset/images \
+  --labels-dir master_dataset/labels \
+  --model runs/detect/train/weights/best.pt \
+  --output-labels-dir master_dataset/labels_with_text \
+  --container-class 0 \
+  --text-class 1 \
+  --pad-x-ratio 0.10 \
+  --pad-y-ratio 0.10 \
+  --conf 0.30 \
+  --device 0 \
+  --save-debug \
+  --debug-dir debug_text_zones
+
+
+
+
+
+
 #!/usr/bin/env python3
 """
-Анализ кадров контейнеров обученной YOLO-моделью.
+Добавляет в существующий YOLO-dataset зоны текста, найденные второй YOLO-моделью.
 
-Скрипт рекурсивно ищет изображения внутри связок device_* / cam_*,
-копирует их в результат с группировкой по качеству детекции, сохраняет
-label-файлы и формирует CSV-отчеты.
+Исходная разметка:
+    <container_class> x_center y_center width height
+
+Выходная разметка:
+    исходные bbox + <text_class> x_center y_center width height
+
+Модель зон текста запускается не на полном изображении, а на расширенном кропе
+каждого bbox номера контейнера.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import hashlib
-import html
-import re
-import shutil
+import math
+import os
 import sys
-import time
-from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean, median
-from typing import Any, Iterable
+from typing import Iterable, Optional
 
-try:
-    from ultralytics import YOLO
-except ImportError:  # pragma: no cover - проверяется при запуске у пользователя
-    YOLO = None  # type: ignore[assignment]
-
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-RESULT_GROUPS = ("zero_objects", "low_conf", "single_good", "multiple_objects")
-DEFAULT_CLASS_NAMES = {
-    0: "end_full_readable",
-    1: "end_partial_visible",
-    2: "end_unreadable",
-    3: "side_full_readable",
-    4: "side_partial_visible",
-    5: "side_unreadable",
-}
+import cv2
+import numpy as np
+from ultralytics import YOLO
 
 
 @dataclass(frozen=True)
-class ImageInfo:
-    """Метаданные изображения, извлеченные из пути."""
-
-    source_path: Path
-    device_id: str
-    camera_id: str
-    frame_number: int | None
-    image_name: str
-
-
-@dataclass(frozen=True)
-class Detection:
-    """Одна детекция YOLO в нормализованном формате."""
-
+class Annotation:
     class_id: int
-    class_name: str
-    confidence: float
-    x_center: float
-    y_center: float
+    xc: float
+    yc: float
     width: float
     height: float
 
 
 @dataclass(frozen=True)
-class ProcessedImage:
-    """Итог обработки одного изображения."""
-
-    info: ImageInfo
-    detections: list[Detection]
-    result_group: str
-    saved_image_path: Path
-    saved_label_path: Path
+class TextPrediction:
+    xyxy: tuple[float, float, float, float]
+    confidence: float
+    detector_class: int
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass
+class Statistics:
+    images_found: int = 0
+    images_processed: int = 0
+    images_without_labels: int = 0
+    images_without_parent_boxes: int = 0
+    parent_boxes_processed: int = 0
+    raw_detections: int = 0
+    filtered_by_class: int = 0
+    filtered_by_geometry: int = 0
+    duplicates_removed: int = 0
+    text_boxes_added: int = 0
+    errors: int = 0
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Анализ изображений контейнеров через ultralytics.YOLO."
+        description=(
+            "Добавить bbox зон текста в YOLO-разметку, запуская модель "
+            "на расширенных кропах bbox номера контейнера."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--weights", required=True, type=Path, help="Путь к весам YOLO")
-    parser.add_argument("--src", required=True, type=Path, help="Корневая папка с кадрами")
-    parser.add_argument("--out", required=True, type=Path, help="Папка результата")
+
+    # Обязательные пути.
     parser.add_argument(
-        "--min-conf",
-        type=float,
-        default=0.25,
-        help="Минимальная confidence для учета детекции",
-    )
-    parser.add_argument(
-        "--good-conf",
-        type=float,
-        default=0.50,
-        help="Порог хорошей confidence",
+        "--images-dir",
+        type=Path,
+        required=True,
+        help="Корень папки с исходными изображениями.",
     )
     parser.add_argument(
-        "--device",
-        default=None,
-        help="Устройство инференса: cpu, cuda:0 и т.д.",
+        "--labels-dir",
+        type=Path,
+        required=True,
+        help="Корень папки с существующими YOLO txt-аннотациями.",
     )
     parser.add_argument(
-        "--classes",
-        default=None,
-        help="Необязательный список классов через запятую: 0,1 или имена классов",
+        "--model",
+        type=Path,
+        required=True,
+        help="Путь к weights второй YOLO-модели, например best.pt.",
     )
     parser.add_argument(
-        "--frame-regex",
+        "--output-labels-dir",
+        type=Path,
+        required=True,
+        help="Новая папка для объединённой разметки. Исходные labels не меняются.",
+    )
+
+    # Классы итогового датасета.
+    parser.add_argument(
+        "--container-class",
+        type=int,
+        default=0,
+        help="ID существующего класса bbox номера контейнера.",
+    )
+    parser.add_argument(
+        "--text-class",
+        type=int,
+        default=1,
+        help="ID добавляемого класса зоны текста в итоговом датасете.",
+    )
+    parser.add_argument(
+        "--detector-classes",
+        type=int,
+        nargs="*",
         default=None,
         help=(
-            "Необязательное regex-правило для номера фрейма. "
-            "Если есть группа, берется первая группа. Пример: 'img_(\\d+)'"
+            "Классы второй модели, которые считать зонами текста. "
+            "Если не указано, принимаются все классы модели."
         ),
     )
-    return parser.parse_args()
+
+    # Расширение исходного bbox перед созданием кропа.
+    parser.add_argument(
+        "--pad-x-ratio",
+        type=float,
+        default=0.10,
+        help="Расширение bbox слева и справа как доля ширины исходного bbox.",
+    )
+    parser.add_argument(
+        "--pad-y-ratio",
+        type=float,
+        default=0.10,
+        help="Расширение bbox сверху и снизу как доля высоты исходного bbox.",
+    )
+    parser.add_argument(
+        "--pad-x-pixels",
+        type=int,
+        default=0,
+        help="Дополнительное расширение слева и справа в пикселях.",
+    )
+    parser.add_argument(
+        "--pad-y-pixels",
+        type=int,
+        default=0,
+        help="Дополнительное расширение сверху и снизу в пикселях.",
+    )
+
+    # Необязательный ручной resize кропа.
+    parser.add_argument(
+        "--resize-crop-width",
+        type=int,
+        default=None,
+        help=(
+            "Принудительная ширина кропа перед моделью. Использовать только если "
+            "обучающие кропы предварительно растягивались вручную."
+        ),
+    )
+    parser.add_argument(
+        "--resize-crop-height",
+        type=int,
+        default=None,
+        help="Принудительная высота кропа перед моделью.",
+    )
+
+    # Параметры инференса Ultralytics.
+    parser.add_argument("--conf", type=float, default=0.25, help="Порог confidence.")
+    parser.add_argument("--iou", type=float, default=0.70, help="IoU для NMS модели.")
+    parser.add_argument("--imgsz", type=int, default=640, help="Размер инференса YOLO.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help='Устройство: "cpu", "0", "0,1" и т. п. Если не задано — выбор Ultralytics.',
+    )
+    parser.add_argument(
+        "--max-det",
+        type=int,
+        default=100,
+        help="Максимум предсказаний второй модели на один кроп.",
+    )
+    parser.add_argument(
+        "--half",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Использовать FP16, если устройство и модель это поддерживают.",
+    )
+    parser.add_argument(
+        "--agnostic-nms",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Class-agnostic NMS внутри второй модели.",
+    )
+
+    # Геометрические фильтры.
+    parser.add_argument(
+        "--min-inside-ratio",
+        type=float,
+        default=0.50,
+        help=(
+            "Минимальная доля площади найденной зоны, находящаяся внутри "
+            "исходного bbox номера. 0 отключает проверку."
+        ),
+    )
+    parser.add_argument(
+        "--clip-to-container",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Обрезать добавляемые зоны по границам исходного bbox номера.",
+    )
+    parser.add_argument(
+        "--min-width-px",
+        type=float,
+        default=2.0,
+        help="Минимальная ширина итоговой зоны в пикселях.",
+    )
+    parser.add_argument(
+        "--min-height-px",
+        type=float,
+        default=2.0,
+        help="Минимальная высота итоговой зоны в пикселях.",
+    )
+    parser.add_argument(
+        "--dedup-iou",
+        type=float,
+        default=0.70,
+        help=(
+            "Удалять повторные добавляемые bbox с IoU не ниже этого значения. "
+            "Значение 1 отключает практическое удаление дублей."
+        ),
+    )
+
+    # Поведение при повторном запуске.
+    parser.add_argument(
+        "--replace-existing-text",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Удалять из исходной разметки старые объекты text-class перед "
+            "добавлением новых. Это предотвращает накопление дублей."
+        ),
+    )
+
+    # Поиск файлов и отладка.
+    parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Искать изображения во вложенных папках.",
+    )
+    parser.add_argument(
+        "--image-exts",
+        nargs="+",
+        default=[".jpg", ".jpeg", ".png", ".bmp", ".webp"],
+        help="Расширения изображений.",
+    )
+    parser.add_argument(
+        "--save-debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Сохранять изображения с нарисованными bbox.",
+    )
+    parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=Path("debug_text_zones"),
+        help="Папка для отладочных изображений.",
+    )
+    parser.add_argument(
+        "--strict",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Остановить весь процесс при первой ошибке.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Выполнить обработку без записи labels и debug-изображений.",
+    )
+
+    return parser
 
 
-def validate_common_args(args: argparse.Namespace) -> None:
-    if YOLO is None:
-        raise RuntimeError(
-            "Не установлен пакет ultralytics. Установите его: pip install ultralytics"
+def validate_args(args: argparse.Namespace) -> None:
+    if not args.images_dir.is_dir():
+        raise ValueError(f"Папка images не найдена: {args.images_dir}")
+    if not args.labels_dir.is_dir():
+        raise ValueError(f"Папка labels не найдена: {args.labels_dir}")
+    if not args.model.is_file():
+        raise ValueError(f"Файл модели не найден: {args.model}")
+
+    if args.images_dir.resolve() == args.output_labels_dir.resolve():
+        raise ValueError("output-labels-dir не должна совпадать с images-dir.")
+
+    for name in ("pad_x_ratio", "pad_y_ratio"):
+        if getattr(args, name) < 0:
+            raise ValueError(f"{name} не может быть отрицательным.")
+
+    for name in ("pad_x_pixels", "pad_y_pixels"):
+        if getattr(args, name) < 0:
+            raise ValueError(f"{name} не может быть отрицательным.")
+
+    if not 0.0 <= args.conf <= 1.0:
+        raise ValueError("--conf должен быть в диапазоне 0..1.")
+    if not 0.0 <= args.iou <= 1.0:
+        raise ValueError("--iou должен быть в диапазоне 0..1.")
+    if not 0.0 <= args.min_inside_ratio <= 1.0:
+        raise ValueError("--min-inside-ratio должен быть в диапазоне 0..1.")
+    if not 0.0 <= args.dedup_iou <= 1.0:
+        raise ValueError("--dedup-iou должен быть в диапазоне 0..1.")
+    if args.imgsz <= 0 or args.max_det <= 0:
+        raise ValueError("--imgsz и --max-det должны быть больше нуля.")
+
+    resize_values = (args.resize_crop_width, args.resize_crop_height)
+    if (resize_values[0] is None) != (resize_values[1] is None):
+        raise ValueError(
+            "--resize-crop-width и --resize-crop-height должны задаваться вместе."
         )
-    if not args.weights.is_file():
-        raise FileNotFoundError(f"Файл весов не найден: {args.weights}")
-    if not args.src.is_dir():
-        raise NotADirectoryError(f"Исходная папка не найдена: {args.src}")
-    if not 0.0 <= args.min_conf <= 1.0:
-        raise ValueError("--min-conf должен быть в диапазоне от 0 до 1")
-    if not 0.0 <= args.good_conf <= 1.0:
-        raise ValueError("--good-conf должен быть в диапазоне от 0 до 1")
-    if args.min_conf > args.good_conf:
-        raise ValueError("--min-conf не должен быть больше --good-conf")
-    if args.frame_regex:
-        try:
-            re.compile(args.frame_regex)
-        except re.error as exc:
-            raise ValueError(f"Некорректный --frame-regex: {exc}") from exc
+    if resize_values[0] is not None and (
+        resize_values[0] <= 0 or resize_values[1] <= 0
+    ):
+        raise ValueError("Размер ручного resize должен быть больше нуля.")
 
-
-def sorted_paths(paths: Iterable[Path]) -> list[Path]:
-    return sorted(paths, key=lambda p: str(p).lower())
-
-
-def is_image(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-
-
-def is_device_dir_name(name: str) -> bool:
-    return name.lower().startswith("device_")
-
-
-def is_camera_dir_name(name: str) -> bool:
-    return name.lower().startswith("cam_")
-
-
-def int_from_regex_match(match: re.Match[str]) -> int | None:
-    value = match.group(1) if match.groups() else match.group(0)
-    number_match = re.search(r"\d+", value)
-    return int(number_match.group(0)) if number_match else None
-
-
-def extract_frame_number(path: Path, frame_regex: str | None = None) -> int | None:
-    path_parts = [path.stem, *reversed(path.parent.parts)]
-
-    if frame_regex:
-        for part in path_parts:
-            custom_match = re.search(frame_regex, part, flags=re.IGNORECASE)
-            if custom_match:
-                return int_from_regex_match(custom_match)
-
-    for part in path_parts:
-        frame_match = re.search(r"frame[_-]?(\d+)", part, flags=re.IGNORECASE)
-        if frame_match:
-            return int(frame_match.group(1))
-
-    number_matches = re.findall(r"\d+", path.stem)
-    if number_matches:
-        return int(number_matches[-1])
-
-    return None
-
-
-def extract_image_info(path: Path, frame_regex: str | None = None) -> ImageInfo | None:
-    parts = path.parts
-    device_index = next(
-        (idx for idx, part in enumerate(parts) if is_device_dir_name(part)), None
-    )
-    if device_index is None:
-        return None
-
-    camera_index = next(
-        (
-            idx
-            for idx in range(device_index + 1, len(parts))
-            if is_camera_dir_name(parts[idx])
-        ),
-        None,
-    )
-    if camera_index is None:
-        return None
-
-    return ImageInfo(
-        source_path=path,
-        device_id=parts[device_index],
-        camera_id=parts[camera_index],
-        frame_number=extract_frame_number(path, frame_regex),
-        image_name=path.name,
-    )
+    if args.container_class < 0 or args.text_class < 0:
+        raise ValueError("ID классов не могут быть отрицательными.")
+    if args.container_class == args.text_class:
+        raise ValueError("--container-class и --text-class должны отличаться.")
 
 
 def discover_images(
-    src: Path, frame_regex: str | None = None
-) -> tuple[list[ImageInfo], set[str], set[tuple[str, str]]]:
-    devices = {path.name for path in src.rglob("*") if path.is_dir() and is_device_dir_name(path.name)}
-    cameras: set[tuple[str, str]] = set()
-    images: list[ImageInfo] = []
-
-    for image_path in sorted_paths(path for path in src.rglob("*") if is_image(path)):
-        info = extract_image_info(image_path, frame_regex)
-        if info is None:
-            continue
-        images.append(info)
-        cameras.add((info.device_id, info.camera_id))
-
-    return images, devices, cameras
+    images_dir: Path, extensions: Iterable[str], recursive: bool
+) -> list[Path]:
+    normalized_exts = {
+        ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in extensions
+    }
+    iterator = images_dir.rglob("*") if recursive else images_dir.glob("*")
+    return sorted(
+        path
+        for path in iterator
+        if path.is_file() and path.suffix.lower() in normalized_exts
+    )
 
 
-def normalize_model_names(raw_names: Any) -> dict[int, str]:
-    if isinstance(raw_names, dict):
-        return {int(key): str(value) for key, value in raw_names.items()}
-    if isinstance(raw_names, (list, tuple)):
-        return {idx: str(value) for idx, value in enumerate(raw_names)}
-    return DEFAULT_CLASS_NAMES.copy()
+def read_yolo_labels(label_path: Path) -> list[Annotation]:
+    if not label_path.exists():
+        raise FileNotFoundError(str(label_path))
 
+    annotations: list[Annotation] = []
+    text = label_path.read_text(encoding="utf-8").strip()
 
-def class_name(class_id: int, model_names: dict[int, str]) -> str:
-    return model_names.get(class_id, DEFAULT_CLASS_NAMES.get(class_id, str(class_id)))
+    if not text:
+        return annotations
 
-
-def parse_classes(raw_classes: str | None, model_names: dict[int, str]) -> list[int] | None:
-    if not raw_classes:
-        return None
-
-    reverse_names = {name: class_id for class_id, name in model_names.items()}
-    parsed: list[int] = []
-    for raw_item in raw_classes.split(","):
-        item = raw_item.strip()
-        if not item:
-            continue
-        if item.isdigit():
-            parsed.append(int(item))
-            continue
-        if item in reverse_names:
-            parsed.append(reverse_names[item])
-            continue
-        raise ValueError(f"Класс из --classes не найден в модели: {item}")
-
-    return parsed or None
-
-
-def classify_result(detections: list[Detection], good_conf: float) -> str:
-    if not detections:
-        return "zero_objects"
-    if len(detections) >= 2:
-        return "multiple_objects"
-    return "single_good" if detections[0].confidence >= good_conf else "low_conf"
-
-
-def single_detection_class_folder(detections: list[Detection]) -> str | None:
-    return detections[0].class_name if len(detections) == 1 else None
-
-
-def short_path_hash(path: Path) -> str:
-    return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:10]
-
-
-def destination_paths(
-    info: ImageInfo, detections: list[Detection], result_group: str, out_dir: Path
-) -> tuple[Path, Path]:
-    class_folder = single_detection_class_folder(detections)
-    relative_parts = [info.device_id, info.camera_id, result_group]
-    if class_folder is not None:
-        relative_parts.append(class_folder)
-
-    image_dir = out_dir / "images" / Path(*relative_parts)
-    label_dir = out_dir / "labels" / Path(*relative_parts)
-    image_dir.mkdir(parents=True, exist_ok=True)
-    label_dir.mkdir(parents=True, exist_ok=True)
-
-    image_path = image_dir / info.image_name
-    label_path = label_dir / f"{info.source_path.stem}.txt"
-
-    if image_path.exists() or label_path.exists():
-        suffix = short_path_hash(info.source_path)
-        image_path = image_dir / f"{info.source_path.stem}_{suffix}{info.source_path.suffix}"
-        label_path = label_dir / f"{info.source_path.stem}_{suffix}.txt"
-
-    return image_path, label_path
-
-
-def write_label_file(path: Path, detections: list[Detection]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as label_file:
-        for detection in detections:
-            # Формат: class_id x_center y_center width height confidence class_name
-            label_file.write(
-                f"{detection.class_id} "
-                f"{detection.x_center:.6f} "
-                f"{detection.y_center:.6f} "
-                f"{detection.width:.6f} "
-                f"{detection.height:.6f} "
-                f"{detection.confidence:.6f} "
-                f"{detection.class_name}\n"
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        parts = raw_line.split()
+        if len(parts) != 5:
+            raise ValueError(
+                f"{label_path}, строка {line_number}: ожидалось 5 значений "
+                f"detect-разметки, получено {len(parts)}."
             )
 
+        try:
+            class_value = float(parts[0])
+            class_id = int(class_value)
+            values = [float(value) for value in parts[1:]]
+        except ValueError as exc:
+            raise ValueError(
+                f"{label_path}, строка {line_number}: нечисловое значение."
+            ) from exc
 
-def run_yolo_on_image(
-    model: Any,
-    image_path: Path,
-    min_conf: float,
-    device: str | None,
-    classes: list[int] | None,
-    model_names: dict[int, str],
-) -> list[Detection]:
-    predict_kwargs: dict[str, Any] = {
-        "source": str(image_path),
-        "conf": min_conf,
+        if not math.isclose(class_value, class_id):
+            raise ValueError(
+                f"{label_path}, строка {line_number}: ID класса должен быть целым."
+            )
+
+        xc, yc, width, height = values
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(
+                f"{label_path}, строка {line_number}: обнаружен NaN или inf."
+            )
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                f"{label_path}, строка {line_number}: ширина и высота должны быть > 0."
+            )
+        if not all(0.0 <= value <= 1.0 for value in values):
+            raise ValueError(
+                f"{label_path}, строка {line_number}: координаты должны быть в 0..1."
+            )
+
+        annotations.append(Annotation(class_id, xc, yc, width, height))
+
+    return annotations
+
+
+def yolo_to_xyxy(
+    annotation: Annotation, image_width: int, image_height: int
+) -> tuple[float, float, float, float]:
+    box_width = annotation.width * image_width
+    box_height = annotation.height * image_height
+    center_x = annotation.xc * image_width
+    center_y = annotation.yc * image_height
+
+    return (
+        center_x - box_width / 2,
+        center_y - box_height / 2,
+        center_x + box_width / 2,
+        center_y + box_height / 2,
+    )
+
+
+def xyxy_to_yolo(
+    class_id: int,
+    box: tuple[float, float, float, float],
+    image_width: int,
+    image_height: int,
+) -> Annotation:
+    x1, y1, x2, y2 = box
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+    xc = x1 + width / 2
+    yc = y1 + height / 2
+
+    return Annotation(
+        class_id=class_id,
+        xc=min(1.0, max(0.0, xc / image_width)),
+        yc=min(1.0, max(0.0, yc / image_height)),
+        width=min(1.0, max(0.0, width / image_width)),
+        height=min(1.0, max(0.0, height / image_height)),
+    )
+
+
+def clip_box(
+    box: tuple[float, float, float, float],
+    x_min: float,
+    y_min: float,
+    x_max: float,
+    y_max: float,
+) -> tuple[float, float, float, float]:
+    x1, y1, x2, y2 = box
+    return (
+        min(x_max, max(x_min, x1)),
+        min(y_max, max(y_min, y1)),
+        min(x_max, max(x_min, x2)),
+        min(y_max, max(y_min, y2)),
+    )
+
+
+def intersection_box(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> Optional[tuple[float, float, float, float]]:
+    x1 = max(first[0], second[0])
+    y1 = max(first[1], second[1])
+    x2 = min(first[2], second[2])
+    y2 = min(first[3], second[3])
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def box_area(box: tuple[float, float, float, float]) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def box_iou(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    intersection = intersection_box(first, second)
+    if intersection is None:
+        return 0.0
+
+    intersection_area = box_area(intersection)
+    union = box_area(first) + box_area(second) - intersection_area
+    return intersection_area / union if union > 0 else 0.0
+
+
+def inside_ratio(
+    child: tuple[float, float, float, float],
+    parent: tuple[float, float, float, float],
+) -> float:
+    child_area = box_area(child)
+    if child_area <= 0:
+        return 0.0
+
+    intersection = intersection_box(child, parent)
+    return box_area(intersection) / child_area if intersection else 0.0
+
+
+def expand_parent_box(
+    parent: tuple[float, float, float, float],
+    image_width: int,
+    image_height: int,
+    pad_x_ratio: float,
+    pad_y_ratio: float,
+    pad_x_pixels: int,
+    pad_y_pixels: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = parent
+    width = x2 - x1
+    height = y2 - y1
+
+    pad_x = width * pad_x_ratio + pad_x_pixels
+    pad_y = height * pad_y_ratio + pad_y_pixels
+
+    crop_x1 = max(0, math.floor(x1 - pad_x))
+    crop_y1 = max(0, math.floor(y1 - pad_y))
+    crop_x2 = min(image_width, math.ceil(x2 + pad_x))
+    crop_y2 = min(image_height, math.ceil(y2 + pad_y))
+
+    return crop_x1, crop_y1, crop_x2, crop_y2
+
+
+def deduplicate_predictions(
+    predictions: list[TextPrediction], iou_threshold: float
+) -> tuple[list[TextPrediction], int]:
+    if not predictions:
+        return [], 0
+
+    ordered = sorted(predictions, key=lambda item: item.confidence, reverse=True)
+    kept: list[TextPrediction] = []
+    removed = 0
+
+    for candidate in ordered:
+        if any(box_iou(candidate.xyxy, accepted.xyxy) >= iou_threshold for accepted in kept):
+            removed += 1
+            continue
+        kept.append(candidate)
+
+    return kept, removed
+
+
+def format_annotation(annotation: Annotation) -> str:
+    return (
+        f"{annotation.class_id} "
+        f"{annotation.xc:.6f} "
+        f"{annotation.yc:.6f} "
+        f"{annotation.width:.6f} "
+        f"{annotation.height:.6f}"
+    )
+
+
+def atomic_write_labels(path: Path, annotations: list[Annotation]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+
+    content = "\n".join(format_annotation(item) for item in annotations)
+    if content:
+        content += "\n"
+
+    temp_path.write_text(content, encoding="utf-8")
+    os.replace(temp_path, path)
+
+
+def draw_debug(
+    image: np.ndarray,
+    parent_boxes: list[tuple[float, float, float, float]],
+    crop_boxes: list[tuple[int, int, int, int]],
+    predictions: list[TextPrediction],
+) -> np.ndarray:
+    output = image.copy()
+
+    # Синий: исходный bbox номера контейнера.
+    for x1, y1, x2, y2 in parent_boxes:
+        cv2.rectangle(
+            output,
+            (round(x1), round(y1)),
+            (round(x2), round(y2)),
+            (255, 0, 0),
+            2,
+        )
+
+    # Жёлтый: расширенный кроп, поданный во вторую модель.
+    for x1, y1, x2, y2 in crop_boxes:
+        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 255, 255), 1)
+
+    # Красный: добавленная зона текста.
+    for prediction in predictions:
+        x1, y1, x2, y2 = prediction.xyxy
+        cv2.rectangle(
+            output,
+            (round(x1), round(y1)),
+            (round(x2), round(y2)),
+            (0, 0, 255),
+            2,
+        )
+        cv2.putText(
+            output,
+            f"text {prediction.confidence:.2f}",
+            (round(x1), max(15, round(y1) - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return output
+
+
+def predict_text_zones(
+    model: YOLO,
+    image: np.ndarray,
+    parent_box: tuple[float, float, float, float],
+    args: argparse.Namespace,
+    stats: Statistics,
+) -> tuple[list[TextPrediction], tuple[int, int, int, int]]:
+    image_height, image_width = image.shape[:2]
+
+    crop_box = expand_parent_box(
+        parent=parent_box,
+        image_width=image_width,
+        image_height=image_height,
+        pad_x_ratio=args.pad_x_ratio,
+        pad_y_ratio=args.pad_y_ratio,
+        pad_x_pixels=args.pad_x_pixels,
+        pad_y_pixels=args.pad_y_pixels,
+    )
+    crop_x1, crop_y1, crop_x2, crop_y2 = crop_box
+
+    if crop_x2 - crop_x1 < 2 or crop_y2 - crop_y1 < 2:
+        return [], crop_box
+
+    original_crop = image[crop_y1:crop_y2, crop_x1:crop_x2]
+    model_input = original_crop
+    scale_x = 1.0
+    scale_y = 1.0
+
+    if args.resize_crop_width is not None:
+        model_input = cv2.resize(
+            original_crop,
+            (args.resize_crop_width, args.resize_crop_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        scale_x = original_crop.shape[1] / args.resize_crop_width
+        scale_y = original_crop.shape[0] / args.resize_crop_height
+
+    predict_kwargs = {
+        "source": model_input,
+        "conf": args.conf,
+        "iou": args.iou,
+        "imgsz": args.imgsz,
+        "max_det": args.max_det,
+        "half": args.half,
+        "agnostic_nms": args.agnostic_nms,
         "verbose": False,
     }
-    if device:
-        predict_kwargs["device"] = device
-    if classes is not None:
-        predict_kwargs["classes"] = classes
+    if args.device is not None:
+        predict_kwargs["device"] = args.device
 
     results = model.predict(**predict_kwargs)
-    if not results:
-        return []
+    if not results or results[0].boxes is None:
+        return [], crop_box
 
-    result = results[0]
-    if result.boxes is None:
-        return []
+    boxes = results[0].boxes
+    if len(boxes) == 0:
+        return [], crop_box
 
-    detections: list[Detection] = []
-    for box in result.boxes:
-        confidence = float(box.conf[0])
-        if confidence < min_conf:
+    xyxy_array = boxes.xyxy.detach().cpu().numpy()
+    confidence_array = boxes.conf.detach().cpu().numpy()
+    class_array = boxes.cls.detach().cpu().numpy().astype(int)
+
+    accepted_classes = (
+        set(args.detector_classes) if args.detector_classes is not None else None
+    )
+
+    predictions: list[TextPrediction] = []
+
+    for local_box, confidence, detector_class in zip(
+        xyxy_array, confidence_array, class_array
+    ):
+        stats.raw_detections += 1
+
+        if accepted_classes is not None and detector_class not in accepted_classes:
+            stats.filtered_by_class += 1
             continue
 
-        class_id = int(box.cls[0])
-        x_center, y_center, width, height = (float(value) for value in box.xywhn[0].tolist())
-        detections.append(
-            Detection(
-                class_id=class_id,
-                class_name=class_name(class_id, model_names),
-                confidence=confidence,
-                x_center=x_center,
-                y_center=y_center,
-                width=width,
-                height=height,
-            )
+        local_x1, local_y1, local_x2, local_y2 = map(float, local_box)
+
+        # Возврат из ручного resize к размеру расширенного кропа.
+        local_x1 *= scale_x
+        local_x2 *= scale_x
+        local_y1 *= scale_y
+        local_y2 *= scale_y
+
+        global_box = (
+            crop_x1 + local_x1,
+            crop_y1 + local_y1,
+            crop_x1 + local_x2,
+            crop_y1 + local_y2,
         )
+        global_box = clip_box(global_box, 0.0, 0.0, image_width, image_height)
 
-    return sorted(detections, key=lambda item: item.confidence, reverse=True)
-
-
-def ensure_result_directories(out_dir: Path) -> Path:
-    reports_dir = out_dir / "reports"
-    (out_dir / "images").mkdir(parents=True, exist_ok=True)
-    (out_dir / "labels").mkdir(parents=True, exist_ok=True)
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    return reports_dir
-
-
-def process_images(
-    model: Any,
-    images: list[ImageInfo],
-    out_dir: Path,
-    min_conf: float,
-    good_conf: float,
-    device: str | None,
-    classes: list[int] | None,
-    model_names: dict[int, str],
-    reports_dir: Path,
-) -> tuple[list[ProcessedImage], list[dict[str, str]]]:
-    processed: list[ProcessedImage] = []
-    errors: list[dict[str, str]] = []
-    total = len(images)
-    started_at = time.time()
-
-    for index, info in enumerate(images, start=1):
-        try:
-            detections = run_yolo_on_image(
-                model=model,
-                image_path=info.source_path,
-                min_conf=min_conf,
-                device=device,
-                classes=classes,
-                model_names=model_names,
-            )
-            result_group = classify_result(detections, good_conf)
-            saved_image_path, saved_label_path = destination_paths(
-                info=info,
-                detections=detections,
-                result_group=result_group,
-                out_dir=out_dir,
-            )
-            shutil.copy2(info.source_path, saved_image_path)
-            write_label_file(saved_label_path, detections)
-            processed.append(
-                ProcessedImage(
-                    info=info,
-                    detections=detections,
-                    result_group=result_group,
-                    saved_image_path=saved_image_path,
-                    saved_label_path=saved_label_path,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 - важно продолжать обработку
-            errors.append(
-                {
-                    "source_path": str(info.source_path),
-                    "device_id": info.device_id,
-                    "camera_id": info.camera_id,
-                    "frame_number": "" if info.frame_number is None else str(info.frame_number),
-                    "image_name": info.image_name,
-                    "error": repr(exc),
-                }
-            )
-
-        show_progress(index=index, total=total, started_at=started_at)
-
-    print()
-    write_errors_csv(reports_dir / "errors.csv", errors)
-    return processed, errors
-
-
-def show_progress(index: int, total: int, started_at: float) -> None:
-    elapsed = max(time.time() - started_at, 0.001)
-    speed = index / elapsed
-    percent = index * 100 / total
-    message = f"\rОбработка: {index}/{total} ({percent:6.2f}%), {speed:.2f} img/s"
-    print(message, end="", flush=True)
-
-
-def csv_list(values: Iterable[Any]) -> str:
-    return ";".join(str(value) for value in values)
-
-
-def confidences(detections: list[Detection]) -> list[float]:
-    return [detection.confidence for detection in detections]
-
-
-def max_conf(detections: list[Detection]) -> float | None:
-    values = confidences(detections)
-    return max(values) if values else None
-
-
-def mean_conf(detections: list[Detection]) -> float | None:
-    values = confidences(detections)
-    return mean(values) if values else None
-
-
-def format_float(value: float | None) -> str:
-    return "" if value is None else f"{value:.6f}"
-
-
-def write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def write_errors_csv(path: Path, rows: list[dict[str, str]]) -> None:
-    fieldnames = [
-        "source_path",
-        "device_id",
-        "camera_id",
-        "frame_number",
-        "image_name",
-        "error",
-    ]
-    write_csv(path, fieldnames, rows)
-
-
-def detection_row(item: ProcessedImage) -> dict[str, Any]:
-    detections = item.detections
-    return {
-        "source_path": str(item.info.source_path),
-        "device_id": item.info.device_id,
-        "camera_id": item.info.camera_id,
-        "frame_number": "" if item.info.frame_number is None else item.info.frame_number,
-        "image_name": item.info.image_name,
-        "objects_count": len(detections),
-        "result_group": item.result_group,
-        "class_ids": csv_list(detection.class_id for detection in detections),
-        "class_names": csv_list(detection.class_name for detection in detections),
-        "confidences": csv_list(f"{detection.confidence:.6f}" for detection in detections),
-        "max_conf": format_float(max_conf(detections)),
-        "mean_conf": format_float(mean_conf(detections)),
-        "bbox_count": len(detections),
-        "saved_image_path": str(item.saved_image_path),
-        "saved_label_path": str(item.saved_label_path),
-    }
-
-
-def write_detections_csv(path: Path, processed: list[ProcessedImage]) -> None:
-    fieldnames = [
-        "source_path",
-        "device_id",
-        "camera_id",
-        "frame_number",
-        "image_name",
-        "objects_count",
-        "result_group",
-        "class_ids",
-        "class_names",
-        "confidences",
-        "max_conf",
-        "mean_conf",
-        "bbox_count",
-        "saved_image_path",
-        "saved_label_path",
-    ]
-    write_csv(path, fieldnames, [detection_row(item) for item in processed])
-
-
-def readable_count(detections: Iterable[Detection]) -> int:
-    return sum("full_readable" in detection.class_name for detection in detections)
-
-
-def partial_visible_count(detections: Iterable[Detection]) -> int:
-    return sum("partial_visible" in detection.class_name for detection in detections)
-
-
-def unreadable_count(detections: Iterable[Detection]) -> int:
-    return sum("unreadable" in detection.class_name for detection in detections)
-
-
-def end_count(detections: Iterable[Detection]) -> int:
-    return sum(detection.class_name.startswith("end_") for detection in detections)
-
-
-def side_count(detections: Iterable[Detection]) -> int:
-    return sum(detection.class_name.startswith("side_") for detection in detections)
-
-
-def camera_sort_key(row: dict[str, Any]) -> tuple[int, float, float, int, int]:
-    return (
-        int(row["single_good_count"]),
-        float(row["good_detection_rate"]),
-        float(row["average_confidence"] or 0.0),
-        -int(row["zero_objects_count"]),
-        -int(row["multiple_objects_count"]),
-    )
-
-
-def write_camera_summary_csv(
-    path: Path, processed: list[ProcessedImage]
-) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str], list[ProcessedImage]] = defaultdict(list)
-    for item in processed:
-        grouped[(item.info.device_id, item.info.camera_id)].append(item)
-
-    rows: list[dict[str, Any]] = []
-    for (device_id, camera_id), items in grouped.items():
-        group_counter = Counter(item.result_group for item in items)
-        all_detections = [
-            detection for item in items for detection in item.detections
-        ]
-        conf_values = [detection.confidence for detection in all_detections]
-        total_images = len(items)
-        row = {
-            "device_id": device_id,
-            "camera_id": camera_id,
-            "total_images": total_images,
-            "zero_objects_count": group_counter["zero_objects"],
-            "low_conf_count": group_counter["low_conf"],
-            "single_good_count": group_counter["single_good"],
-            "multiple_objects_count": group_counter["multiple_objects"],
-            "good_detection_rate": f"{group_counter['single_good'] / total_images:.6f}",
-            "average_confidence": format_float(mean(conf_values) if conf_values else None),
-            "median_confidence": format_float(median(conf_values) if conf_values else None),
-            "max_confidence": format_float(max(conf_values) if conf_values else None),
-            "readable_count": readable_count(all_detections),
-            "partial_visible_count": partial_visible_count(all_detections),
-            "unreadable_count": unreadable_count(all_detections),
-            "end_count": end_count(all_detections),
-            "side_count": side_count(all_detections),
-            "camera_rank": 0,
-        }
-        rows.append(row)
-
-    rows.sort(key=camera_sort_key, reverse=True)
-    for rank, row in enumerate(rows, start=1):
-        row["camera_rank"] = rank
-
-    fieldnames = [
-        "camera_rank",
-        "device_id",
-        "camera_id",
-        "total_images",
-        "zero_objects_count",
-        "low_conf_count",
-        "single_good_count",
-        "multiple_objects_count",
-        "good_detection_rate",
-        "average_confidence",
-        "median_confidence",
-        "max_confidence",
-        "readable_count",
-        "partial_visible_count",
-        "unreadable_count",
-        "end_count",
-        "side_count",
-    ]
-    write_csv(path, fieldnames, rows)
-    return rows
-
-
-def best_single_detection(item: ProcessedImage) -> Detection | None:
-    return item.detections[0] if len(item.detections) == 1 else None
-
-
-def write_frame_summary_csv(path: Path, processed: list[ProcessedImage]) -> None:
-    rows: list[dict[str, Any]] = []
-    for item in processed:
-        detection = best_single_detection(item)
-        rows.append(
-            {
-                "device_id": item.info.device_id,
-                "camera_id": item.info.camera_id,
-                "frame_number": "" if item.info.frame_number is None else item.info.frame_number,
-                "result_group": item.result_group,
-                "class_name": "" if detection is None else detection.class_name,
-                "confidence": "" if detection is None else f"{detection.confidence:.6f}",
-                "source_path": str(item.info.source_path),
-            }
-        )
-
-    fieldnames = [
-        "device_id",
-        "camera_id",
-        "frame_number",
-        "result_group",
-        "class_name",
-        "confidence",
-        "source_path",
-    ]
-    write_csv(path, fieldnames, rows)
-
-
-def is_full_readable(detection: Detection) -> bool:
-    return "full_readable" in detection.class_name
-
-
-def orientation(detection: Detection) -> str:
-    if detection.class_name.startswith("end_"):
-        return "end"
-    if detection.class_name.startswith("side_"):
-        return "side"
-    return "unknown"
-
-
-def best_frames_rows(processed: list[ProcessedImage]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str], list[ProcessedImage]] = defaultdict(list)
-    for item in processed:
-        if len(item.detections) == 1:
-            grouped[(item.info.device_id, item.info.camera_id)].append(item)
-
-    rows: list[dict[str, Any]] = []
-    for (device_id, camera_id), items in grouped.items():
-        items_by_conf = sorted(
-            items,
-            key=lambda item: (
-                item.detections[0].confidence,
-                -1 if item.info.frame_number is None else item.info.frame_number,
-            ),
-            reverse=True,
-        )
-
-        for rank, item in enumerate(items_by_conf[:10], start=1):
-            rows.append(best_frame_row("top_confidence", rank, item))
-
-        readable_items = [
-            item for item in items_by_conf if is_full_readable(item.detections[0])
-        ]
-        end_items = [
-            item for item in items_by_conf if orientation(item.detections[0]) == "end"
-        ]
-        side_items = [
-            item for item in items_by_conf if orientation(item.detections[0]) == "side"
-        ]
-
-        if readable_items:
-            rows.append(best_frame_row("best_readable", 1, readable_items[0]))
-        if end_items:
-            rows.append(best_frame_row("best_end", 1, end_items[0]))
-        if side_items:
-            rows.append(best_frame_row("best_side", 1, side_items[0]))
-
-    return rows
-
-
-def best_frame_row(kind: str, rank: int, item: ProcessedImage) -> dict[str, Any]:
-    detection = item.detections[0]
-    return {
-        "selection_type": kind,
-        "rank": rank,
-        "device_id": item.info.device_id,
-        "camera_id": item.info.camera_id,
-        "frame_number": "" if item.info.frame_number is None else item.info.frame_number,
-        "class_id": detection.class_id,
-        "class_name": detection.class_name,
-        "confidence": f"{detection.confidence:.6f}",
-        "source_path": str(item.info.source_path),
-        "saved_image_path": str(item.saved_image_path),
-        "saved_label_path": str(item.saved_label_path),
-    }
-
-
-def write_best_frames_csv(path: Path, processed: list[ProcessedImage]) -> list[dict[str, Any]]:
-    rows = best_frames_rows(processed)
-    fieldnames = [
-        "selection_type",
-        "rank",
-        "device_id",
-        "camera_id",
-        "frame_number",
-        "class_id",
-        "class_name",
-        "confidence",
-        "source_path",
-        "saved_image_path",
-        "saved_label_path",
-    ]
-    write_csv(path, fieldnames, rows)
-    return rows
-
-
-def consecutive_key(item: ProcessedImage) -> tuple[int, str]:
-    if item.info.frame_number is None:
-        return (sys.maxsize, item.info.image_name)
-    return (item.info.frame_number, item.info.image_name)
-
-
-def candidate_for_best_range(item: ProcessedImage, good_conf: float) -> bool:
-    if len(item.detections) != 1:
-        return False
-    detection = item.detections[0]
-    return detection.confidence >= good_conf and is_full_readable(detection)
-
-
-def numbered_single_detection(item: ProcessedImage) -> bool:
-    return item.info.frame_number is not None and len(item.detections) == 1
-
-
-def numbered_good_detection(item: ProcessedImage, good_conf: float) -> bool:
-    return numbered_single_detection(item) and item.detections[0].confidence >= good_conf
-
-
-def build_consecutive_ranges(items: list[ProcessedImage]) -> list[list[ProcessedImage]]:
-    ordered = sorted(items, key=consecutive_key)
-    if not ordered:
-        return []
-
-    ranges: list[list[ProcessedImage]] = []
-    current_range = [ordered[0]]
-    for item in ordered[1:]:
-        previous_frame = current_range[-1].info.frame_number
-        current_frame = item.info.frame_number
-        if (
-            previous_frame is not None
-            and current_frame is not None
-            and current_frame in (previous_frame, previous_frame + 1)
-        ):
-            current_range.append(item)
-        else:
-            ranges.append(current_range)
-            current_range = [item]
-    ranges.append(current_range)
-    return ranges
-
-
-def best_range_row(
-    device_id: str,
-    camera_id: str,
-    range_type: str,
-    items: list[ProcessedImage],
-) -> dict[str, Any]:
-    conf_values = [item.detections[0].confidence for item in items]
-    frame_numbers = [
-        item.info.frame_number for item in items if item.info.frame_number is not None
-    ]
-    return {
-        "device_id": device_id,
-        "camera_id": camera_id,
-        "range_type": range_type,
-        "start_frame": min(frame_numbers),
-        "end_frame": max(frame_numbers),
-        "frames_count": len(set(frame_numbers)),
-        "average_confidence": f"{mean(conf_values):.6f}",
-        "max_confidence": f"{max(conf_values):.6f}",
-    }
-
-
-def empty_range_row(device_id: str, camera_id: str, range_type: str) -> dict[str, Any]:
-    return {
-        "device_id": device_id,
-        "camera_id": camera_id,
-        "range_type": range_type,
-        "start_frame": "",
-        "end_frame": "",
-        "frames_count": 0,
-        "average_confidence": "",
-        "max_confidence": "",
-    }
-
-
-def select_best_range(
-    ranges: list[list[ProcessedImage]],
-) -> list[ProcessedImage]:
-    return max(
-        ranges,
-        key=lambda group: (
-            len({item.info.frame_number for item in group}),
-            mean(item.detections[0].confidence for item in group),
-            max(item.detections[0].confidence for item in group),
-        ),
-    )
-
-
-def best_consecutive_ranges(processed: list[ProcessedImage], good_conf: float) -> list[dict[str, Any]]:
-    grouped_all: dict[tuple[str, str], list[ProcessedImage]] = defaultdict(list)
-    for item in processed:
-        grouped_all[(item.info.device_id, item.info.camera_id)].append(item)
-
-    rows: list[dict[str, Any]] = []
-    for (device_id, camera_id), items in grouped_all.items():
-        candidate_levels = [
-            (
-                "full_readable_good",
-                [
-                    item
-                    for item in items
-                    if item.info.frame_number is not None
-                    and candidate_for_best_range(item, good_conf)
-                ],
-            ),
-            (
-                "any_class_good",
-                [item for item in items if numbered_good_detection(item, good_conf)],
-            ),
-            (
-                "any_single_object",
-                [item for item in items if numbered_single_detection(item)],
-            ),
-        ]
-
-        selected_type = ""
-        selected_ranges: list[list[ProcessedImage]] = []
-        for range_type, candidates in candidate_levels:
-            selected_ranges = build_consecutive_ranges(candidates)
-            if selected_ranges:
-                selected_type = range_type
-                break
-
-        if selected_ranges:
-            best_range = select_best_range(selected_ranges)
-            rows.append(best_range_row(device_id, camera_id, selected_type, best_range))
+        if inside_ratio(global_box, parent_box) < args.min_inside_ratio:
+            stats.filtered_by_geometry += 1
             continue
 
-        if any(len(item.detections) == 1 for item in items):
-            rows.append(empty_range_row(device_id, camera_id, "no_frame_number"))
-        elif any(item.detections for item in items):
-            rows.append(empty_range_row(device_id, camera_id, "no_single_object"))
-        else:
-            rows.append(empty_range_row(device_id, camera_id, "no_detection"))
+        if args.clip_to_container:
+            clipped = intersection_box(global_box, parent_box)
+            if clipped is None:
+                stats.filtered_by_geometry += 1
+                continue
+            global_box = clipped
 
-    rows.sort(key=lambda row: (row["device_id"], row["camera_id"]))
-    return rows
+        width = global_box[2] - global_box[0]
+        height = global_box[3] - global_box[1]
+        if width < args.min_width_px or height < args.min_height_px:
+            stats.filtered_by_geometry += 1
+            continue
+
+        predictions.append(
+            TextPrediction(
+                xyxy=global_box,
+                confidence=float(confidence),
+                detector_class=int(detector_class),
+            )
+        )
+
+    return predictions, crop_box
 
 
-def write_best_ranges_csv(
-    path: Path, processed: list[ProcessedImage], good_conf: float
-) -> list[dict[str, Any]]:
-    rows = best_consecutive_ranges(processed, good_conf)
-    fieldnames = [
-        "device_id",
-        "camera_id",
-        "range_type",
-        "start_frame",
-        "end_frame",
-        "frames_count",
-        "average_confidence",
-        "max_confidence",
+def process_image(
+    image_path: Path,
+    model: YOLO,
+    args: argparse.Namespace,
+    stats: Statistics,
+) -> None:
+    relative_path = image_path.relative_to(args.images_dir)
+    label_path = args.labels_dir / relative_path.with_suffix(".txt")
+    output_label_path = args.output_labels_dir / relative_path.with_suffix(".txt")
+
+    if not label_path.exists():
+        stats.images_without_labels += 1
+        print(f"[SKIP] Нет label: {label_path}")
+        return
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"OpenCV не смог прочитать изображение: {image_path}")
+
+    image_height, image_width = image.shape[:2]
+    annotations = read_yolo_labels(label_path)
+
+    parent_annotations = [
+        item for item in annotations if item.class_id == args.container_class
     ]
-    write_csv(path, fieldnames, rows)
-    return rows
 
+    if not parent_annotations:
+        stats.images_without_parent_boxes += 1
 
-def relative_uri(target_path: str | Path, base_dir: Path) -> str:
-    """Возвращает относительный URI для ссылок из HTML-отчета."""
-
-    try:
-        relative = Path(target_path).resolve().relative_to(base_dir.resolve())
-    except ValueError:
-        try:
-            relative = Path(target_path).resolve().relative_to(base_dir.parent.resolve())
-            return "../" + relative.as_posix()
-        except ValueError:
-            return Path(target_path).as_posix()
-    return relative.as_posix()
-
-
-def css_bar(value: float, maximum: float) -> str:
-    if maximum <= 0:
-        return "0%"
-    return f"{min(max(value / maximum, 0.0), 1.0) * 100:.2f}%"
-
-
-def group_counts(processed: list[ProcessedImage]) -> Counter[str]:
-    return Counter(item.result_group for item in processed)
-
-
-def render_camera_table(camera_rows: list[dict[str, Any]]) -> str:
-    max_single_good = max(
-        (int(row["single_good_count"]) for row in camera_rows), default=0
-    )
-    rows_html: list[str] = []
-    for row in camera_rows:
-        rate = float(row["good_detection_rate"])
-        single_good = int(row["single_good_count"])
-        rows_html.append(
-            "<tr>"
-            f"<td>{html.escape(str(row['camera_rank']))}</td>"
-            f"<td>{html.escape(str(row['device_id']))}</td>"
-            f"<td>{html.escape(str(row['camera_id']))}</td>"
-            f"<td>{html.escape(str(row['total_images']))}</td>"
-            f"<td><div class=\"bar\"><span style=\"width:{css_bar(single_good, max_single_good)}\"></span></div>{single_good}</td>"
-            f"<td><div class=\"bar good\"><span style=\"width:{rate * 100:.2f}%\"></span></div>{rate:.3f}</td>"
-            f"<td>{html.escape(str(row['average_confidence']))}</td>"
-            f"<td>{html.escape(str(row['zero_objects_count']))}</td>"
-            f"<td>{html.escape(str(row['multiple_objects_count']))}</td>"
-            "</tr>"
-        )
-
-    return "\n".join(rows_html)
-
-
-def render_best_frames(best_frame_rows: list[dict[str, Any]], reports_dir: Path) -> str:
-    top_rows = [row for row in best_frame_rows if row["selection_type"] == "top_confidence"]
-    cards: list[str] = []
-    for row in top_rows[:60]:
-        image_uri = relative_uri(row["saved_image_path"], reports_dir)
-        cards.append(
-            "<article class=\"frame-card\">"
-            f"<a href=\"{html.escape(image_uri)}\"><img src=\"{html.escape(image_uri)}\" loading=\"lazy\" alt=\"\"></a>"
-            "<div class=\"frame-meta\">"
-            f"<strong>{html.escape(str(row['device_id']))} / {html.escape(str(row['camera_id']))}</strong>"
-            f"<span>rank {html.escape(str(row['rank']))}, frame {html.escape(str(row['frame_number']))}</span>"
-            f"<span>{html.escape(str(row['class_name']))}</span>"
-            f"<span>conf {html.escape(str(row['confidence']))}</span>"
-            "</div>"
-            "</article>"
-        )
-    if not cards:
-        return "<p class=\"muted\">Нет кадров с ровно одной детекцией.</p>"
-    return "\n".join(cards)
-
-
-def render_ranges_table(best_range_rows: list[dict[str, Any]]) -> str:
-    rows_html: list[str] = []
-    for row in best_range_rows:
-        rows_html.append(
-            "<tr>"
-            f"<td>{html.escape(str(row['device_id']))}</td>"
-            f"<td>{html.escape(str(row['camera_id']))}</td>"
-            f"<td>{html.escape(str(row['range_type']))}</td>"
-            f"<td>{html.escape(str(row['start_frame']))}</td>"
-            f"<td>{html.escape(str(row['end_frame']))}</td>"
-            f"<td>{html.escape(str(row['frames_count']))}</td>"
-            f"<td>{html.escape(str(row['average_confidence']))}</td>"
-            f"<td>{html.escape(str(row['max_confidence']))}</td>"
-            "</tr>"
-        )
-    return "\n".join(rows_html)
-
-
-def write_html_report(
-    path: Path,
-    processed: list[ProcessedImage],
-    camera_rows: list[dict[str, Any]],
-    best_frame_rows: list[dict[str, Any]],
-    best_range_rows: list[dict[str, Any]],
-) -> None:
-    counts = group_counts(processed)
-    total = len(processed)
-    best_camera = camera_rows[0] if camera_rows else None
-    best_camera_text = (
-        f"{best_camera['device_id']} / {best_camera['camera_id']}"
-        if best_camera
-        else "нет данных"
-    )
-
-    cards = "".join(
-        f"<div class=\"metric {group}\"><span>{group}</span><strong>{counts[group]}</strong></div>"
-        for group in RESULT_GROUPS
-    )
-    html_text = f"""<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Отчет анализа контейнеров</title>
-  <style>
-    body {{ margin: 0; font: 14px/1.45 Arial, sans-serif; color: #17202a; background: #f6f7f9; }}
-    header {{ padding: 28px 32px; color: white; background: #1f2937; }}
-    h1, h2 {{ margin: 0; }}
-    h1 {{ font-size: 28px; }}
-    h2 {{ margin: 28px 0 12px; font-size: 20px; }}
-    main {{ max-width: 1280px; margin: 0 auto; padding: 24px 32px 48px; }}
-    .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 18px; }}
-    .metric {{ border-left: 5px solid #607d8b; padding: 12px 14px; background: white; box-shadow: 0 1px 2px rgba(0,0,0,.08); }}
-    .metric span {{ display: block; color: #5f6b7a; }}
-    .metric strong {{ font-size: 26px; }}
-    .metric.single_good {{ border-color: #2e7d32; }}
-    .metric.low_conf {{ border-color: #f9a825; }}
-    .metric.zero_objects {{ border-color: #c62828; }}
-    .metric.multiple_objects {{ border-color: #6a1b9a; }}
-    table {{ width: 100%; border-collapse: collapse; background: white; box-shadow: 0 1px 2px rgba(0,0,0,.08); }}
-    th, td {{ padding: 9px 10px; border-bottom: 1px solid #e4e7eb; text-align: left; vertical-align: middle; }}
-    th {{ position: sticky; top: 0; background: #eef1f5; z-index: 1; }}
-    .bar {{ display: inline-block; width: 120px; height: 8px; margin-right: 8px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }}
-    .bar span {{ display: block; height: 100%; background: #2563eb; }}
-    .bar.good span {{ background: #16a34a; }}
-    .frames {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }}
-    .frame-card {{ overflow: hidden; background: white; box-shadow: 0 1px 2px rgba(0,0,0,.08); }}
-    .frame-card img {{ display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #d1d5db; }}
-    .frame-meta {{ display: grid; gap: 3px; padding: 10px; }}
-    .frame-meta span {{ color: #526071; }}
-    .muted {{ color: #687385; }}
-    .links a {{ color: #1d4ed8; margin-right: 14px; }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Отчет анализа контейнеров</h1>
-    <p>Всего обработано: {total}. Лучшая пара device/camera: {html.escape(best_camera_text)}.</p>
-  </header>
-  <main>
-    <section class="summary">
-      <div class="metric"><span>total_images</span><strong>{total}</strong></div>
-      {cards}
-    </section>
-
-    <h2>Рейтинг камер</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>rank</th><th>device</th><th>camera</th><th>images</th>
-          <th>single_good</th><th>good rate</th><th>avg conf</th>
-          <th>zero</th><th>multiple</th>
-        </tr>
-      </thead>
-      <tbody>
-        {render_camera_table(camera_rows)}
-      </tbody>
-    </table>
-
-    <h2>Лучшие фреймы</h2>
-    <div class="frames">
-      {render_best_frames(best_frame_rows, path.parent)}
-    </div>
-
-    <h2>Лучшие диапазоны фреймов</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>device</th><th>camera</th><th>range_type</th><th>start_frame</th><th>end_frame</th>
-          <th>frames_count</th><th>average_confidence</th><th>max_confidence</th>
-        </tr>
-      </thead>
-      <tbody>
-        {render_ranges_table(best_range_rows)}
-      </tbody>
-    </table>
-
-    <h2>CSV-файлы</h2>
-    <p class="links">
-      <a href="detections.csv">detections.csv</a>
-      <a href="camera_summary.csv">camera_summary.csv</a>
-      <a href="frame_summary.csv">frame_summary.csv</a>
-      <a href="best_frames.csv">best_frames.csv</a>
-      <a href="best_frame_ranges.csv">best_frame_ranges.csv</a>
-      <a href="errors.csv">errors.csv</a>
-    </p>
-  </main>
-</body>
-</html>
-"""
-    path.write_text(html_text, encoding="utf-8")
-
-
-def write_reports(
-    reports_dir: Path, processed: list[ProcessedImage], good_conf: float
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    write_detections_csv(reports_dir / "detections.csv", processed)
-    camera_rows = write_camera_summary_csv(reports_dir / "camera_summary.csv", processed)
-    write_frame_summary_csv(reports_dir / "frame_summary.csv", processed)
-    best_frame_rows = write_best_frames_csv(reports_dir / "best_frames.csv", processed)
-    best_range_rows = write_best_ranges_csv(
-        reports_dir / "best_frame_ranges.csv", processed, good_conf
-    )
-    write_html_report(
-        reports_dir / "report.html",
-        processed,
-        camera_rows,
-        best_frame_rows,
-        best_range_rows,
-    )
-    return camera_rows, best_frame_rows, best_range_rows
-
-
-def validate_discovery(
-    images: list[ImageInfo], devices: set[str], cameras: set[tuple[str, str]]
-) -> None:
-    if not devices:
-        raise RuntimeError("Не найдены папки device_*")
-    if not cameras:
-        raise RuntimeError("Не найдены пары device_* / cam_* с изображениями")
-    if not images:
-        raise RuntimeError(
-            "Не найдены изображения с расширениями "
-            f"{', '.join(sorted(IMAGE_EXTENSIONS))} внутри device_* / cam_*"
-        )
-
-
-def print_summary(
-    processed: list[ProcessedImage],
-    errors: list[dict[str, str]],
-    camera_rows: list[dict[str, Any]],
-    best_frame_rows: list[dict[str, Any]],
-    reports_dir: Path,
-) -> None:
-    group_counter = Counter(item.result_group for item in processed)
-    print("\nИтоговая статистика")
-    print(f"Всего успешно обработано изображений: {len(processed)}")
-    print(f"Ошибок обработки изображений: {len(errors)}")
-    for group in RESULT_GROUPS:
-        print(f"{group}: {group_counter[group]}")
-
-    if camera_rows:
-        best_camera = camera_rows[0]
-        print(
-            "Лучшая камера: "
-            f"{best_camera['camera_id']} "
-            f"(single_good={best_camera['single_good_count']}, "
-            f"good_detection_rate={best_camera['good_detection_rate']})"
-        )
-        print(
-            "Лучшая пара device + camera: "
-            f"{best_camera['device_id']} + {best_camera['camera_id']}"
-        )
+    if args.replace_existing_text:
+        base_annotations = [
+            item for item in annotations if item.class_id != args.text_class
+        ]
+        old_text_boxes: list[tuple[float, float, float, float]] = []
     else:
-        print("Лучшая камера: нет данных")
-        print("Лучшая пара device + camera: нет данных")
+        base_annotations = list(annotations)
+        old_text_boxes = [
+            yolo_to_xyxy(item, image_width, image_height)
+            for item in annotations
+            if item.class_id == args.text_class
+        ]
 
-    top_frames = [row for row in best_frame_rows if row["selection_type"] == "top_confidence"][:10]
-    print("Лучшие фреймы:")
-    if not top_frames:
-        print("  нет кадров с ровно одной детекцией")
-    for row in top_frames:
-        print(
-            "  "
-            f"{row['device_id']} / {row['camera_id']} / frame={row['frame_number']} "
-            f"/ {row['class_name']} / conf={row['confidence']}"
+    parent_boxes: list[tuple[float, float, float, float]] = []
+    crop_boxes: list[tuple[int, int, int, int]] = []
+    new_predictions: list[TextPrediction] = []
+
+    for parent_annotation in parent_annotations:
+        raw_parent_box = yolo_to_xyxy(
+            parent_annotation, image_width, image_height
+        )
+        parent_box = clip_box(
+            raw_parent_box, 0.0, 0.0, image_width, image_height
         )
 
-    print(f"Путь к отчетам: {reports_dir}")
+        if box_area(parent_box) <= 0:
+            stats.filtered_by_geometry += 1
+            continue
+
+        stats.parent_boxes_processed += 1
+        parent_boxes.append(parent_box)
+
+        predictions, crop_box = predict_text_zones(
+            model=model,
+            image=image,
+            parent_box=parent_box,
+            args=args,
+            stats=stats,
+        )
+        crop_boxes.append(crop_box)
+        new_predictions.extend(predictions)
+
+    new_predictions, removed = deduplicate_predictions(
+        new_predictions, args.dedup_iou
+    )
+    stats.duplicates_removed += removed
+
+    # Если старые text-class оставляются, не добавляем к ним почти идентичные новые bbox.
+    if old_text_boxes:
+        filtered_predictions: list[TextPrediction] = []
+        for prediction in new_predictions:
+            if any(
+                box_iou(prediction.xyxy, old_box) >= args.dedup_iou
+                for old_box in old_text_boxes
+            ):
+                stats.duplicates_removed += 1
+            else:
+                filtered_predictions.append(prediction)
+        new_predictions = filtered_predictions
+
+    added_annotations = [
+        xyxy_to_yolo(
+            class_id=args.text_class,
+            box=prediction.xyxy,
+            image_width=image_width,
+            image_height=image_height,
+        )
+        for prediction in new_predictions
+    ]
+
+    output_annotations = base_annotations + added_annotations
+
+    if not args.dry_run:
+        atomic_write_labels(output_label_path, output_annotations)
+
+        if args.save_debug:
+            debug_path = args.debug_dir / relative_path
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            debug_image = draw_debug(
+                image=image,
+                parent_boxes=parent_boxes,
+                crop_boxes=crop_boxes,
+                predictions=new_predictions,
+            )
+            if not cv2.imwrite(str(debug_path), debug_image):
+                raise OSError(f"Не удалось записать debug: {debug_path}")
+
+    stats.text_boxes_added += len(added_annotations)
+    stats.images_processed += 1
+
+    print(
+        f"[OK] {relative_path} | parents={len(parent_boxes)} "
+        f"| text_added={len(added_annotations)}"
+    )
+
+
+def print_summary(stats: Statistics, args: argparse.Namespace) -> None:
+    mode = "DRY RUN" if args.dry_run else "ЗАПИСЬ ВЫПОЛНЕНА"
+    print("\n" + "=" * 64)
+    print(f"РЕЗУЛЬТАТ: {mode}")
+    print(f"Найдено изображений:              {stats.images_found}")
+    print(f"Успешно обработано:               {stats.images_processed}")
+    print(f"Без соответствующего label:       {stats.images_without_labels}")
+    print(f"Без bbox container-class:         {stats.images_without_parent_boxes}")
+    print(f"Обработано bbox контейнеров:       {stats.parent_boxes_processed}")
+    print(f"Сырых detections второй модели:   {stats.raw_detections}")
+    print(f"Отфильтровано по классу:          {stats.filtered_by_class}")
+    print(f"Отфильтровано по геометрии:       {stats.filtered_by_geometry}")
+    print(f"Удалено дублей:                   {stats.duplicates_removed}")
+    print(f"Добавлено bbox зон текста:        {stats.text_boxes_added}")
+    print(f"Ошибок:                           {stats.errors}")
+    if not args.dry_run:
+        print(f"Выходные labels:                  {args.output_labels_dir}")
+        if args.save_debug:
+            print(f"Debug-изображения:                {args.debug_dir}")
+    print("=" * 64)
 
 
 def main() -> int:
-    args = parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+
     try:
-        validate_common_args(args)
-        reports_dir = ensure_result_directories(args.out)
+        validate_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-        print("Поиск изображений...")
-        images, devices, cameras = discover_images(args.src, args.frame_regex)
-        validate_discovery(images, devices, cameras)
-        print(f"Найдено device_*: {len(devices)}")
-        print(f"Найдено пар device_* / cam_* с изображениями: {len(cameras)}")
-        print(f"Найдено изображений: {len(images)}")
+    if not args.dry_run:
+        args.output_labels_dir.mkdir(parents=True, exist_ok=True)
+        if args.save_debug:
+            args.debug_dir.mkdir(parents=True, exist_ok=True)
 
-        print("Загрузка YOLO-модели...")
-        model = YOLO(str(args.weights))
-        model_names = normalize_model_names(getattr(model, "names", None))
-        classes = parse_classes(args.classes, model_names)
+    images = discover_images(
+        images_dir=args.images_dir,
+        extensions=args.image_exts,
+        recursive=args.recursive,
+    )
 
-        processed, errors = process_images(
-            model=model,
-            images=images,
-            out_dir=args.out,
-            min_conf=args.min_conf,
-            good_conf=args.good_conf,
-            device=args.device,
-            classes=classes,
-            model_names=model_names,
-            reports_dir=reports_dir,
-        )
+    stats = Statistics(images_found=len(images))
 
-        camera_rows, best_frame_rows, _best_range_rows = write_reports(
-            reports_dir=reports_dir,
-            processed=processed,
-            good_conf=args.good_conf,
-        )
-        print_summary(
-            processed=processed,
-            errors=errors,
-            camera_rows=camera_rows,
-            best_frame_rows=best_frame_rows,
-            reports_dir=reports_dir,
-        )
-        return 0
-    except Exception as exc:  # noqa: BLE001 - CLI должен вывести понятную ошибку
-        print(f"Ошибка: {exc}", file=sys.stderr)
-        return 1
+    if not images:
+        print("Изображения не найдены.", file=sys.stderr)
+        return 2
+
+    print(f"Загрузка модели: {args.model}")
+    model = YOLO(str(args.model))
+
+    for index, image_path in enumerate(images, start=1):
+        print(f"[{index}/{len(images)}] {image_path}")
+        try:
+            process_image(
+                image_path=image_path,
+                model=model,
+                args=args,
+                stats=stats,
+            )
+        except Exception as exc:
+            stats.errors += 1
+            print(f"[ERROR] {image_path}: {exc}", file=sys.stderr)
+            if args.strict:
+                raise
+
+    print_summary(stats, args)
+    return 0 if stats.errors == 0 else 1
 
 
 if __name__ == "__main__":
